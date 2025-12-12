@@ -1,11 +1,17 @@
 #include <ESP8266WiFi.h>
+#include <ArduinoJson.h>
+#include <ESP8266HTTPClient.h>
 
 const char* ssid = "Stom fiber Adam jee";
 const char* password = "freefree";
+const char* serverUrl = "http://192.168.1.7:3000/wifi-data";
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(2000);
+
+  Serial.println("\n📡 ESP8266 WiFi Scanner + Node.js Sender");
+  Serial.println("======================================");
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -90,71 +96,79 @@ void loop() {
     digitalWrite(D4, LOW);
     delay(1000);
   }
+
+  // WiFi scan karo
+  Serial.println("🔄 Scanning WiFi networks...");
+  int n = WiFi.scanNetworks(false, true); // async scan
+  
+  if (n == 0) {
+    Serial.println("❌ No networks found!");
+  } else {
+    Serial.print("📊 Found ");
+    Serial.print(n);
+    Serial.println(" networks");
+    
+    // JSON banaye
+    DynamicJsonDocument doc(4096);
+    JsonArray networks = doc.to<JsonArray>();
+    
+    for (int i = 0; i < n; i++) {
+      JsonObject network = networks.createNestedObject();
+      network["ssid"] = WiFi.SSID(i);
+      network["rssi"] = WiFi.RSSI(i);
+      network["channel"] = WiFi.channel(i);
+      network["encryption"] = WiFi.encryptionType(i);
+      network["bssid"] = WiFi.BSSIDstr(i);
+      network["hidden"] = WiFi.isHidden(i);
+      
+      // Serial monitor pe bhi dikhao
+      Serial.print(i + 1);
+      Serial.print(". ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.println(" dBm)");
+    }
+    
+    // JSON stringify karo
+    String jsonData;
+    serializeJson(doc, jsonData);
+    
+    // Server ko send karo
+    sendToServer(jsonData);
+  }
+  
+  // 15 seconds ka wait
+  Serial.println("\n⏳ Waiting 15 seconds...\n");
+  delay(15000);
 }
 
-
-
-// #include <ESP8266WiFi.h>
-
-// const char* ssid = "Adam Jee";
-// const char* password = "Hamza786";
-
-// void setup() {
-//   // put your setup code here, to run once:
-
-
-//   // wifi connection
-//   Serial.begin(115200);
-//   delay(1000);
-
-//   WiFi.mode(WIFI_STA);
-//   WiFi.disconnect();
-//   delay(1000);
-
-//   Serial.println("\nScanning...");
-//   int n = WiFi.scanNetworks();
-//   for (int i = 0; i < n; i++) {
-//     Serial.print(i + 1);
-//     Serial.print(": ");
-//     Serial.print(WiFi.SSID(i));
-//     Serial.print(" | Ch: ");
-//     Serial.print(WiFi.channel(i));
-//     Serial.print(" | RSSI: ");
-//     Serial.println(WiFi.RSSI(i));
-//   }
-
-//   Serial.print("\nConnecting to: ");
-//   Serial.println(ssid);
-
-//   WiFi.begin(ssid, password);
-
-//   int counter = 0;
-//   while (WiFi.status() != WL_CONNECTED) {
-//     delay(500);
-//     Serial.print(".");
-//     counter++;
-//     if (counter > 40) {
-//       Serial.println("\n❌ Failed! Status:");
-//       Serial.println(WiFi.status());
-//       return;
-//     }
-//   }
-
-//   Serial.println("\n✅ Connected!");
-//   Serial.print("IP: ");
-//   Serial.println(WiFi.localIP());
-
-//   if (WiFi.status() == WL_CONNECTED) {
-//     pinMode(D4, OUTPUT);
-//   }
-// }
-
-// void loop() {
-//   // put your main code here, to run repeatedly:
-//   if (WiFi.status() == WL_CONNECTED) {
-//     digitalWrite(D4, HIGH);
-//     delay(1000);
-//     digitalWrite(D4, LOW);
-//     delay(1000);
-//   }
-// }
+void sendToServer(String jsonData) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+    
+    http.begin(client, serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "ESP8266-WiFi-Scanner");
+    
+    Serial.println("📤 Sending data to server...");
+    int httpCode = http.POST(jsonData);
+    
+    if (httpCode > 0) {
+      Serial.print("✅ Data sent! HTTP Code: ");
+      Serial.println(httpCode);
+      
+      String response = http.getString();
+      Serial.print("Server Response: ");
+      Serial.println(response);
+    } else {
+      Serial.print("❌ Error sending data: ");
+      Serial.println(http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+  } else {
+    Serial.println("❌ WiFi disconnected!");
+  }
+}
