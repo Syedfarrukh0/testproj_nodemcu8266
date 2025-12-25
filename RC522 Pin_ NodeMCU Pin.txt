@@ -1,0 +1,10 @@
+| RC522 Pin    | NodeMCU Pin | GPIO   |
+| ------------ | ----------- | ------ |
+| **VCC**      | **3V3**     | 3.3V   |
+| **GND**      | **GND**     | GND    |
+| **SDA (SS)** | **D8**      | GPIO15 |
+| **SCK**      | **D5**      | GPIO14 |
+| **MOSI**     | **D7**      | GPIO13 |
+| **MISO**     | **D6**      | GPIO12 |
+| **RST**      | **D3**      | GPIO0  |
+| IRQ          | ❌ Not used  | —      |
