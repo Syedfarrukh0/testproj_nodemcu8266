@@ -299,6 +299,28 @@ void handleConnectWifi() {
 
   String ssid = doc["ssid"].as<String>();
   String password = doc["password"].as<String>();
+  String reqUuid = doc["deviceUuid"].as<String>();
+  String reqSecret = doc["deviceSecret"].as<String>();
+
+  // check device auth
+  if (reqUuid.length() == 0 || reqSecret.length() == 0) {
+    server.send(
+      401,
+      "application/json",
+      "{\"success\":false,\"message\":\"Device credentials missing\"}");
+    return;
+  }
+
+  if (reqUuid != DEVICE_UUID || reqSecret != DEVICE_SECRET) {
+    Serial.println("❌ Device auth failed for WiFi connect");
+
+    server.send(
+      403,
+      "application/json",
+      "{\"success\":false,\"message\":\"Invalid device credentials\"}");
+    return;
+  }
+
 
   if (ssid.length() == 0) {
     server.send(400, "application/json", "{\"success\":false,\"message\":\"SSID missing\"}");
@@ -325,6 +347,10 @@ void handleConnectWifi() {
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
   server.on("/api/connect-wifi", handleConnectWifi);
+  server.collectHeaders(
+    "x-device-id",
+    "x-device-secret");
+  server.on("/api/wifi/scan", HTTP_GET, scanAndSendWifi);
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -408,6 +434,11 @@ void setup() {
   Serial.println("WiFi Connected!");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
+  sendWifiStatusToServer(
+    "connected",
+    WiFi.SSID(),
+    false,
+    "old Wifi");
 
   // start esp server
   setupServer();
@@ -463,11 +494,6 @@ void loop() {
     if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
       sendHeartbeat();
       lastHeartbeatTime = millis();
-    }
-
-    if (!serverUnreachable && millis() - lastScanTime >= SCAN_INTERVAL) {
-      scanAndSendWifi();
-      lastScanTime = millis();
     }
 
     // ----------------- RFID ATTENDANCE -----------------
@@ -554,8 +580,6 @@ void sendHeartbeat() {
   String payload;
   serializeJson(doc, payload);
 
-  Serial.println(payload);
-
   int code = http.POST(payload);
   if (code == 200) {
     heartbeatFailCount = 0;
@@ -584,7 +608,7 @@ void handleCommand(String json) {
   }
 }
 
-// ================== CONNECT WIFI ==================
+// ================== CONNECT NEW WIFI ==================
 bool connectToWifi(String ssid, String password) {
   Serial.println("\n=== WIFI CONNECT ===");
   Serial.println("SSID: " + ssid);
@@ -628,14 +652,27 @@ bool connectToWifi(String ssid, String password) {
     // Fetch fresh schedules after connecting
     fetchAndStoreSchedules();
 
-    isConnecting = false;
+    // WIFI STATUS CALLBACK
+    sendWifiStatusToServer(
+      "connected",
+      ssid,
+      true,
+      "");
 
+    isConnecting = false;
     return true;
   } else {
     Serial.println("\n❌ WiFi Connection Failed!");
 
     // Failure - red blink twice
     blinkRedTwice();
+
+    // WIFI STATUS CALLBACK (FAIL)
+    sendWifiStatusToServer(
+      "failed",
+      ssid,
+      false,
+      "CONNECTION_TIMEOUT");
 
     delay(500);
     ESP.restart();
@@ -675,6 +712,34 @@ void checkServerUnreachable() {
 
 // ================== WIFI SCAN ==================
 void scanAndSendWifi() {
+
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String reqUuid = server.header("x-device-id");
+  String reqSecret = server.header("x-device-secret");
+
+  // check device auth
+  if (reqUuid.length() == 0 || reqSecret.length() == 0) {
+    server.send(
+      401,
+      "application/json",
+      "{\"success\":false,\"message\":\"Device credentials missing\"}");
+    return;
+  }
+
+  if (reqUuid != DEVICE_UUID || reqSecret != DEVICE_SECRET) {
+    Serial.println("❌ Device auth failed not send wifi scan list");
+
+    server.send(
+      403,
+      "application/json",
+      "{\"success\":false,\"message\":\"Invalid device credentials\"}");
+    return;
+  }
+
   int n = WiFi.scanNetworks();
   if (n <= 0) return;
 
@@ -686,20 +751,15 @@ void scanAndSendWifi() {
     net["rssi"] = WiFi.RSSI(i);
     net["channel"] = WiFi.channel(i);
     net["encryption"] = WiFi.encryptionType(i);
+    net["secure"] = (WiFi.encryptionType(i) != ENC_TYPE_NONE);
   }
 
   String json;
   serializeJson(doc, json);
 
-  HTTPClient http;
-  WiFiClient client;
-  http.begin(client, String(SERVER_URL) + "/api/v1/device/wifi-scan");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-device-id", DEVICE_UUID);
-  http.addHeader("x-device-secret", DEVICE_SECRET);
+  server.send(200, "application/json", json);
 
-  http.POST(json);
-  http.end();
+  WiFi.scanDelete();  // memory clean
 }
 
 // ================== SEND ATTENDANCE FUNCTIONS ==================
@@ -732,6 +792,45 @@ bool sendAttendance(String cardUuid) {
   http.end();
   return (code == 200);
 }
+
+// ================= SEND WIFI CONNECTION STATUS =================
+void sendWifiStatusToServer(
+  String status,
+  String ssid,
+  bool isNewWifi,
+  String reason) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  WiFiClient client;
+
+  String url = String(SERVER_URL) + "/api/v1/device/wifi-status";
+  http.begin(client, url);
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_UUID);
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+  http.addHeader("Connection", "close");
+
+  DynamicJsonDocument doc(256);
+  doc["deviceUuid"] = DEVICE_UUID;
+  doc["status"] = status;  // connected | failed
+  doc["ssid"] = ssid;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  doc["isNewWifi"] = isNewWifi;
+  doc["reason"] = reason;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("📡 WiFi Status Report:");
+  Serial.println(payload);
+
+  http.PATCH(payload);
+  http.end();
+}
+
 
 // ================== SAVE SCHEDULE FUNCTIONS ==================
 void saveScheduleToSD() {
