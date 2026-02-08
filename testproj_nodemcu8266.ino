@@ -9,12 +9,16 @@
 #include <PCF8574.h>
 #include <SD.h>
 #include <FS.h>
+#include <EEPROM.h>
 
 ESP8266WebServer server(80);
 
 // ================== PCF8574 CONFIG ==================
 #define PCF_ADDRESS 0x20  // A0,A1,A2 pins according to wiring
 PCF8574 pcf(PCF_ADDRESS);
+
+// ================== EEPROM CONFIG ==================
+#define EEPROM_LOCAL_STORAGE_ADDR 20
 
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8  // SD card CS pin
@@ -65,6 +69,7 @@ bool connectBlinkState = false;
 bool isConnecting = false;
 bool isInitialScheduleLoaded = false;
 bool sdMounted = false;
+bool localStorage = true;
 
 // ================== STRUCTURES ==================
 struct UserSchedule {
@@ -241,7 +246,9 @@ void fetchAndStoreSchedules() {
           Serial.println("Total schedules added: " + String(scheduleCount));
 
           // Save to sd card
-          saveScheduleToSD();
+          if (localStorage && sdMounted) {
+            saveScheduleToSD();
+          }
 
           Serial.println("Schedules updated. Total schedules in memory: " + String(userSchedules.size()));
 
@@ -289,6 +296,19 @@ void handleConnectWifi() {
     return;
   }
 
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
   DynamicJsonDocument doc(256);
   DeserializationError err = deserializeJson(doc, server.arg("plain"));
 
@@ -299,28 +319,6 @@ void handleConnectWifi() {
 
   String ssid = doc["ssid"].as<String>();
   String password = doc["password"].as<String>();
-  String reqUuid = doc["deviceUuid"].as<String>();
-  String reqSecret = doc["deviceSecret"].as<String>();
-
-  // check device auth
-  if (reqUuid.length() == 0 || reqSecret.length() == 0) {
-    server.send(
-      401,
-      "application/json",
-      "{\"success\":false,\"message\":\"Device credentials missing\"}");
-    return;
-  }
-
-  if (reqUuid != DEVICE_UUID || reqSecret != DEVICE_SECRET) {
-    Serial.println("❌ Device auth failed for WiFi connect");
-
-    server.send(
-      403,
-      "application/json",
-      "{\"success\":false,\"message\":\"Invalid device credentials\"}");
-    return;
-  }
-
 
   if (ssid.length() == 0) {
     server.send(400, "application/json", "{\"success\":false,\"message\":\"SSID missing\"}");
@@ -344,13 +342,83 @@ void handleConnectWifi() {
   }
 }
 
+// ================== LOCALSTORAGE HANDLED FUNCTION ==============
+void handleLocalStorage() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"message\":\"Method not allowed\"}");
+    return;
+  }
+
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(256);
+  deserializeJson(doc, server.arg("plain"));
+
+  if (!doc.containsKey("enabled")) {
+    server.send(400, "application/json", "{\"error\":\"enabled required\"}");
+    return;
+  }
+
+  bool newValue = doc["enabled"];
+
+  if (localStorage != newValue) {
+    localStorage = newValue;
+
+    EEPROM.write(
+      EEPROM_LOCAL_STORAGE_ADDR,
+      localStorage ? 1 : 0);
+    EEPROM.commit();
+  }
+
+  // ===== SD MOUNT / UNMOUNT =====
+  if (localStorage && !sdMounted) {
+    sdMounted = SD.begin(SD_CS_PIN);
+    Serial.println("📀 SD mounted after enable");
+  }
+
+  if (!localStorage && sdMounted) {
+    SD.end();
+    sdMounted = false;
+    userSchedules.clear();
+    Serial.println("📀 SD unmounted after disable");
+  }
+
+  Serial.println("🔁 LocalStorage toggled from server");
+  Serial.print("💾 Saved localStorage = ");
+  Serial.println(localStorage ? "TRUE" : "FALSE");
+
+  server.send(
+    200,
+    "application/json",
+    localStorage
+      ? "{\"success\":true,\"localStorage\":true}"
+      : "{\"success\":true,\"localStorage\":false}");
+
+  server.client().flush();
+  delay(300);
+
+  ESP.reset();
+}
+
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
-  server.on("/api/connect-wifi", handleConnectWifi);
   server.collectHeaders(
     "x-device-id",
     "x-device-secret");
+  server.on("/api/connect-wifi", handleConnectWifi);
   server.on("/api/wifi/scan", HTTP_GET, scanAndSendWifi);
+  server.on("/api/toggle-local-storage", handleLocalStorage);
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -358,22 +426,44 @@ void setupServer() {
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
-  delay(1000);  // Serial stable hone ka wait karo
+  delay(1000);
 
   Serial.println("\n\n=== ESP8266 Attendance Device Starting ===");
 
-  // ================== SD CARD INIT ==================
-  sdMounted = SD.begin(SD_CS_PIN);
-  if (!sdMounted) {
-    Serial.println("❌ SD Card mount failed");
+  // ================== EEPROM INIT ==================
+  EEPROM.begin(512);
+  uint8_t storedLS = EEPROM.read(EEPROM_LOCAL_STORAGE_ADDR);
+
+  if (storedLS == 0 || storedLS == 1) {
+    localStorage = storedLS;
   } else {
-    Serial.println("✅ SD Card mounted successfully");
+    localStorage = true;  // default
+    EEPROM.write(EEPROM_LOCAL_STORAGE_ADDR, 1);
+    EEPROM.commit();
+  }
+
+  Serial.print("🔁 Boot LocalStorage = ");
+  Serial.println(localStorage ? "TRUE" : "FALSE");
+
+  // ================== SD CARD INIT ==================
+  if (localStorage) {
+    sdMounted = SD.begin(SD_CS_PIN);
+    if (!sdMounted) {
+      Serial.println("❌ SD Card mount failed");
+    } else {
+      Serial.println("✅ SD Card mounted successfully");
+    }
+  } else {
+    sdMounted = false;
+    Serial.println("Local storage disabled — SD card skipped");
   }
 
   // ================== LOAD SCHEDULE FROM SD ==================
-  if (loadScheduleFromSD()) {
-    Serial.println("Using stored schedules from SD card");
-    isInitialScheduleLoaded = true;
+  if (localStorage && sdMounted) {
+    if (loadScheduleFromSD()) {
+      Serial.println("Using stored schedules from SD card");
+      isInitialScheduleLoaded = true;
+    }
   }
 
   // ================== PCF8574 INIT ==================
@@ -445,8 +535,10 @@ void setup() {
 
   // Fetch schedules immediately after WiFi connection
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Fetching fresh schedules from server...");
-    fetchAndStoreSchedules();
+    if (localStorage) {
+      Serial.println("Fetching fresh schedules from server...");
+      fetchAndStoreSchedules();
+    }
   } else {
     Serial.println("WiFi not connected, using EEPROM schedules");
   }
@@ -480,9 +572,11 @@ void loop() {
   // ----------------- PERIODIC SCHEDULE UPDATE -----------------
   if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
     server.handleClient();
-    if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
-      fetchAndStoreSchedules();
-      lastScheduleUpdate = millis();
+    if (localStorage) {
+      if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
+        fetchAndStoreSchedules();
+        lastScheduleUpdate = millis();
+      }
     }
   }
 
@@ -506,8 +600,8 @@ void loop() {
 
       Serial.println("Card scanned: " + cardUuid);
 
-      // First check in local schedule (if available)
-      if (userSchedules.size() > 0) {
+      // First check in local schedule (if localstorage is enabled)
+      if (localStorage && userSchedules.size() > 0) {
         bool foundInSchedule = false;
         for (const auto& schedule : userSchedules) {
           if (schedule.cardUuid == cardUuid) {
@@ -574,8 +668,9 @@ void sendHeartbeat() {
 
   // ================== SD CARD STATUS ==================
   JsonObject sd = doc.createNestedObject("sd");
-  sd["mounted"] = sdMounted;
-  sd["scheduleFileExists"] = SD.exists(SCHEDULE_FILE);
+  sd["enabled"] = localStorage;
+  sd["mounted"] = localStorage ? sdMounted : false;
+  sd["scheduleFileExists"] = (localStorage && sdMounted) ? SD.exists(SCHEDULE_FILE) : false;
 
   String payload;
   serializeJson(doc, payload);
@@ -599,13 +694,13 @@ void handleCommand(String json) {
   if (deserializeJson(doc, json)) return;
 
   const char* command = doc["data"]["command"];
-  if (command && strcmp(command, "UPDATE_SCHEDULES") == 0) {
-    // Force schedule update from server
-    Serial.println("Force schedule update requested from server");
-    if (WiFi.status() == WL_CONNECTED) {
-      fetchAndStoreSchedules();
-    }
-  }
+  // if (command && strcmp(command, "UPDATE_SCHEDULES") == 0) {
+  //   // Force schedule update from server
+  //   Serial.println("Force schedule update requested from server");
+  //   if (WiFi.status() == WL_CONNECTED) {
+  //     fetchAndStoreSchedules();
+  //   }
+  // }
 }
 
 // ================== CONNECT NEW WIFI ==================
@@ -650,7 +745,9 @@ bool connectToWifi(String ssid, String password) {
     blinkGreenOnce();
 
     // Fetch fresh schedules after connecting
-    fetchAndStoreSchedules();
+    if (localStorage) {
+      fetchAndStoreSchedules();
+    }
 
     // WIFI STATUS CALLBACK
     sendWifiStatusToServer(
