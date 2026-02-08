@@ -10,6 +10,8 @@
 #include <SD.h>
 #include <FS.h>
 #include <EEPROM.h>
+#include <RTClib.h>
+#include <time.h>
 
 ESP8266WebServer server(80);
 
@@ -70,6 +72,7 @@ bool isConnecting = false;
 bool isInitialScheduleLoaded = false;
 bool sdMounted = false;
 bool localStorage = true;
+bool rtcNeedsSync = false;
 
 // ================== STRUCTURES ==================
 struct UserSchedule {
@@ -96,6 +99,8 @@ StoredData storedData;
 // ================== OBJECTS ==================
 WiFiManager wifiManager;
 MFRC522 rfid(SS_PIN, RST_PIN);
+
+RTC_DS3231 rtc;
 
 // ================== CRC32 FUNCTION ==================
 uint32_t calculateCRC32(const uint8_t* data, size_t length) {
@@ -423,6 +428,52 @@ void setupServer() {
   Serial.println("HTTP server started");
 }
 
+// ============= RTC Update REAL UTC TIME =============
+void setRTCFromNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot sync time.");
+    return;
+  }
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Fetching NTP time...");
+
+  time_t now;
+  int retries = 10;
+
+  while ((now = time(nullptr)) < 1000000000 && retries > 0) {  // Wait until NTP returns valid time
+    Serial.println("Waiting for NTP...");
+    delay(1000);
+    retries--;
+  }
+
+  if (now < 1000000000) {
+    Serial.println("❌ Failed to get NTP time");
+    return;
+  }
+
+  struct tm* timeinfo = gmtime(&now);
+
+  Serial.printf("NTP Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                timeinfo->tm_year + 1900,
+                timeinfo->tm_mon + 1,
+                timeinfo->tm_mday,
+                timeinfo->tm_hour,
+                timeinfo->tm_min,
+                timeinfo->tm_sec);
+
+  // Set RTC
+  rtc.adjust(DateTime(
+    timeinfo->tm_year + 1900,
+    timeinfo->tm_mon + 1,
+    timeinfo->tm_mday,
+    timeinfo->tm_hour,
+    timeinfo->tm_min,
+    timeinfo->tm_sec));
+
+  Serial.println("✅ RTC updated from NTP");
+}
+
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -475,6 +526,30 @@ void setup() {
   pcf.write(BLUE_LED_PIN, LOW);
   pcf.write(GREEN_LED_PIN, LOW);
   pcf.write(RED_LED_PIN, LOW);
+
+  // ================== RTC INIT ==================
+  if (!rtc.begin()) {
+    Serial.println("❌ RTC not found");
+  } else {
+    Serial.println("✅ RTC detected");
+
+    DateTime now = rtc.now();
+    Serial.printf(
+      "⏱️ RTC START TIME: %04d-%02d-%02d %02d:%02d:%02d | DOW: %d\n",
+      now.year(),
+      now.month(),
+      now.day(),
+      now.hour(),
+      now.minute(),
+      now.second(),
+      now.dayOfTheWeek());
+  }
+
+  // ⚠️ Sirf FIRST TIME ke liye
+  if (rtc.lostPower()) {
+    Serial.println("⚠️ RTC lost power — NTP sync required");
+    rtcNeedsSync = true;
+  }
 
   // WHITE LED ON (Booting status)
   pcf.write(WHITE_LED_PIN, HIGH);
@@ -529,6 +604,9 @@ void setup() {
     WiFi.SSID(),
     false,
     "old Wifi");
+  if (rtcNeedsSync) {
+    setRTCFromNTP();
+  }
 
   // start esp server
   setupServer();
@@ -554,6 +632,7 @@ void setup() {
 
 // ================== LOOP ==================
 void loop() {
+
   // ----------------- WHITE LED STATUS -----------------
   if (reprovisionMode) {
     // Config portal mode - White LED ON (still)
