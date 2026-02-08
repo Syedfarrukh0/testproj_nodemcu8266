@@ -53,6 +53,14 @@ const char* DEVICE_SECRET = "ae756ac92c3e4d44361110b3ca4e7d9f";
 #define SCHEDULE_COUNT_ADDR 1004
 #define LAST_UPDATE_ADDR 1008
 
+// ================== TIMEZONE CONFIG ==================
+String deviceTimezone = "UTC";
+int timezoneOffsetMinutes = 0;  // +300 for Asia/Karachi
+
+#define EEPROM_TZ_ADDR 40
+#define EEPROM_OFFSET_ADDR 100
+
+
 // ================== GLOBAL VARIABLES ==================
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastScanTime = 0;
@@ -72,7 +80,6 @@ bool isConnecting = false;
 bool isInitialScheduleLoaded = false;
 bool sdMounted = false;
 bool localStorage = true;
-bool rtcNeedsSync = false;
 
 // ================== STRUCTURES ==================
 struct UserSchedule {
@@ -101,6 +108,25 @@ WiFiManager wifiManager;
 MFRC522 rfid(SS_PIN, RST_PIN);
 
 RTC_DS3231 rtc;
+
+// ================== LOCAL TIME HELPER ==================
+DateTime getLocalTime() {
+  DateTime utc = rtc.now();
+
+  // Convert minutes to hours and minutes
+  int offsetHours = timezoneOffsetMinutes / 60;
+  int offsetMinutes = timezoneOffsetMinutes % 60;
+
+  // Create TimeSpan with correct parameters
+  TimeSpan ts(0, offsetHours, offsetMinutes, 0);
+
+  DateTime local = utc + ts;
+
+  Serial.printf("Local: %02d:%02d:%02d\n",
+                local.hour(), local.minute(), local.second());
+
+  return local;
+}
 
 // ================== CRC32 FUNCTION ==================
 uint32_t calculateCRC32(const uint8_t* data, size_t length) {
@@ -347,7 +373,7 @@ void handleConnectWifi() {
   }
 }
 
-// ================== LOCALSTORAGE HANDLED FUNCTION ==============
+// ================== LOCALSTORAGE HANDLE FUNCTION ==============
 void handleLocalStorage() {
   if (server.method() != HTTP_POST) {
     server.send(405, "application/json", "{\"success\":false,\"message\":\"Method not allowed\"}");
@@ -416,6 +442,61 @@ void handleLocalStorage() {
   ESP.reset();
 }
 
+// ================ LOCAL TIMEZONE HANDLE FUNCTION ==============
+void handleSetTimezone() {
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  if (
+    server.header("x-device-id") != DEVICE_UUID || server.header("x-device-secret") != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  deviceTimezone = doc["timezone"].as<String>();  // Asia/Karachi
+  String offsetStr = doc["offset"];               // +05:00
+
+  int hours = offsetStr.substring(1, 3).toInt();
+  int minutes = offsetStr.substring(4, 6).toInt();
+  timezoneOffsetMinutes = hours * 60 + minutes;
+
+  if (offsetStr.startsWith("-")) {
+    timezoneOffsetMinutes *= -1;
+  }
+
+  // ===== SAVE TO EEPROM =====
+  for (int i = 0; i < 40; i++) EEPROM.write(EEPROM_TZ_ADDR + i, 0);
+  for (int i = 0; i < deviceTimezone.length(); i++) {
+    EEPROM.write(EEPROM_TZ_ADDR + i, deviceTimezone[i]);
+  }
+
+  EEPROM.put(EEPROM_OFFSET_ADDR, timezoneOffsetMinutes);
+  EEPROM.commit();
+
+  Serial.printf(
+    "🌍 Timezone updated: %s (%d min)\n",
+    deviceTimezone.c_str(),
+    timezoneOffsetMinutes);
+
+  // IMMEDIATE TIME CHECK
+  DateTime utc = rtc.now();
+  DateTime local = getLocalTime();
+
+  // Calculate difference
+  int diffHours = local.hour() - utc.hour();
+  int diffMinutes = local.minute() - utc.minute();
+
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
   server.collectHeaders(
@@ -424,6 +505,8 @@ void setupServer() {
   server.on("/api/connect-wifi", handleConnectWifi);
   server.on("/api/wifi/scan", HTTP_GET, scanAndSendWifi);
   server.on("/api/toggle-local-storage", handleLocalStorage);
+  server.on("/api/set-timezone", HTTP_POST, handleSetTimezone);
+
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -436,13 +519,12 @@ void setRTCFromNTP() {
   }
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Fetching NTP time...");
 
   time_t now;
-  int retries = 10;
+  int retries = 30;
 
-  while ((now = time(nullptr)) < 1000000000 && retries > 0) {  // Wait until NTP returns valid time
-    Serial.println("Waiting for NTP...");
+  while ((now = time(nullptr)) < 1000000000 && retries > 0) {
+    Serial.print(".");
     delay(1000);
     retries--;
   }
@@ -453,25 +535,26 @@ void setRTCFromNTP() {
   }
 
   struct tm* timeinfo = gmtime(&now);
-
-  Serial.printf("NTP Time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                timeinfo->tm_year + 1900,
-                timeinfo->tm_mon + 1,
-                timeinfo->tm_mday,
-                timeinfo->tm_hour,
-                timeinfo->tm_min,
-                timeinfo->tm_sec);
-
-  // Set RTC
-  rtc.adjust(DateTime(
+  DateTime ntpTime(
     timeinfo->tm_year + 1900,
     timeinfo->tm_mon + 1,
     timeinfo->tm_mday,
     timeinfo->tm_hour,
     timeinfo->tm_min,
-    timeinfo->tm_sec));
+    timeinfo->tm_sec);
 
-  Serial.println("✅ RTC updated from NTP");
+  rtc.adjust(ntpTime);
+
+  DateTime rtcTime = rtc.now();
+  Serial.printf("RTC Set NTP to: %04d-%02d-%02d %02d:%02d:%02d\n",
+                rtcTime.year(),
+                rtcTime.month(),
+                rtcTime.day(),
+                rtcTime.hour(),
+                rtcTime.minute(),
+                rtcTime.second());
+
+  Serial.println("RTC updated from NTP");
 }
 
 // ================== SETUP ==================
@@ -495,6 +578,26 @@ void setup() {
 
   Serial.print("🔁 Boot LocalStorage = ");
   Serial.println(localStorage ? "TRUE" : "FALSE");
+
+  // ================== LOAD TIMEZONE FROM EEPROM ==================
+  char tzBuf[41];
+  for (int i = 0; i < 40; i++) {
+    tzBuf[i] = EEPROM.read(EEPROM_TZ_ADDR + i);
+  }
+  tzBuf[40] = '\0';
+  deviceTimezone = String(tzBuf);
+  EEPROM.get(EEPROM_OFFSET_ADDR, timezoneOffsetMinutes);
+
+  if (deviceTimezone.length() == 0) {
+    deviceTimezone = "UTC";
+    timezoneOffsetMinutes = 0;
+  }
+
+  Serial.printf(
+    "🌍 Timezone loaded: %s | Offset: %d minutes\n",
+    deviceTimezone.c_str(),
+    timezoneOffsetMinutes);
+
 
   // ================== SD CARD INIT ==================
   if (localStorage) {
@@ -531,24 +634,8 @@ void setup() {
   if (!rtc.begin()) {
     Serial.println("❌ RTC not found");
   } else {
-    Serial.println("✅ RTC detected");
-
-    DateTime now = rtc.now();
-    Serial.printf(
-      "⏱️ RTC START TIME: %04d-%02d-%02d %02d:%02d:%02d | DOW: %d\n",
-      now.year(),
-      now.month(),
-      now.day(),
-      now.hour(),
-      now.minute(),
-      now.second(),
-      now.dayOfTheWeek());
-  }
-
-  // ⚠️ Sirf FIRST TIME ke liye
-  if (rtc.lostPower()) {
-    Serial.println("⚠️ RTC lost power — NTP sync required");
-    rtcNeedsSync = true;
+    Serial.println("RTC detected");
+    DateTime localNow = getLocalTime();
   }
 
   // WHITE LED ON (Booting status)
@@ -604,9 +691,7 @@ void setup() {
     WiFi.SSID(),
     false,
     "old Wifi");
-  if (rtcNeedsSync) {
-    setRTCFromNTP();
-  }
+  setRTCFromNTP();
 
   // start esp server
   setupServer();
@@ -1006,7 +1091,6 @@ void sendWifiStatusToServer(
   http.PATCH(payload);
   http.end();
 }
-
 
 // ================== SAVE SCHEDULE FUNCTIONS ==================
 void saveScheduleToSD() {
