@@ -21,6 +21,7 @@ PCF8574 pcf(PCF_ADDRESS);
 
 // ================== EEPROM CONFIG ==================
 #define EEPROM_LOCAL_STORAGE_ADDR 20
+#define EEPROM_AUTO_SYNC_ADDR 21
 
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8  // SD card CS pin
@@ -138,6 +139,11 @@ const int GRACE_LATE_OUT = 15;           // 15 minutes late check-out allowed
 const int MIN_WORK_DURATION = 30;        // 30 minutes minimum work
 const int MAX_SHIFT_HOURS = 18;          // 18 hours max shift
 const int MIN_GAP_BETWEEN_RECORDS = 10;  // 10 seconds gap between scans
+
+bool autoSyncEnabled = true;  // Default true
+unsigned long lastSyncTime = 0;
+const unsigned long SYNC_INTERVAL = 300000;  // 5 minutes (300,000 ms)
+bool isSyncing = false;
 
 // Today's records storage
 std::vector<TodaysRecord> todaysCheckIns;
@@ -1687,6 +1693,51 @@ void handleDeleteAllTodayRecords() {
   }
 }
 
+// ================== HANDLE AUTO SYNC TOGGLE ==================
+void handleAutoSync() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"message\":\"Method not allowed\"}");
+    return;
+  }
+
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(256);
+  deserializeJson(doc, server.arg("plain"));
+
+  if (!doc.containsKey("enabled")) {
+    server.send(400, "application/json", "{\"error\":\"enabled required\"}");
+    return;
+  }
+
+  bool newValue = doc["enabled"];
+
+  if (autoSyncEnabled != newValue) {
+    autoSyncEnabled = newValue;
+    EEPROM.write(EEPROM_AUTO_SYNC_ADDR, autoSyncEnabled ? 1 : 0);
+    EEPROM.commit();
+  }
+
+  Serial.print("🔄 Auto Sync toggled to: ");
+  Serial.println(autoSyncEnabled ? "TRUE" : "FALSE");
+
+  server.send(200, "application/json",
+              autoSyncEnabled
+                ? "{\"success\":true,\"autoSync\":true}"
+                : "{\"success\":true,\"autoSync\":false}");
+}
+
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
   server.collectHeaders(
@@ -1706,6 +1757,8 @@ void setupServer() {
   server.on("/api/attendance/monthly/delete", HTTP_POST, handleDeleteMonthlyRecords);
 
   server.on("/api/attendance/files", HTTP_GET, handleListFiles);
+
+  server.on("/api/auto-sync", HTTP_POST, handleAutoSync);
 
   server.begin();
   Serial.println("HTTP server started");
@@ -1794,10 +1847,23 @@ void setup() {
     localStorage = true;  // default
     EEPROM.write(EEPROM_LOCAL_STORAGE_ADDR, 1);
     EEPROM.commit();
+
+    Serial.print("🔁 Boot LocalStorage = ");
+    Serial.println(localStorage ? "TRUE" : "FALSE");
   }
 
-  Serial.print("🔁 Boot LocalStorage = ");
-  Serial.println(localStorage ? "TRUE" : "FALSE");
+  // ================== LOAD AUTO SYNC FROM EEPROM ==================
+  uint8_t storedAutoSync = EEPROM.read(EEPROM_AUTO_SYNC_ADDR);
+  if (storedAutoSync == 0 || storedAutoSync == 1) {
+    autoSyncEnabled = storedAutoSync;
+  } else {
+    autoSyncEnabled = true;  // default
+    EEPROM.write(EEPROM_AUTO_SYNC_ADDR, 1);
+    EEPROM.commit();
+
+    Serial.print("🔁 Auto Sync = ");
+    Serial.println(autoSyncEnabled ? "TRUE" : "FALSE");
+  }
 
   // ================== LOAD TIMEZONE FROM EEPROM ==================
   char tzBuf[41];
@@ -2004,6 +2070,12 @@ void loop() {
       if (currentMillis - lastScheduleUpdate >= scheduleUpdateInterval) {
         fetchAndStoreSchedules();
         lastScheduleUpdate = currentMillis;
+      }
+
+      // AUTO SYNC CHECK - Har 5 minutes
+      if (autoSyncEnabled && currentMillis - lastSyncTime >= SYNC_INTERVAL) {
+        lastSyncTime = currentMillis;
+        syncMonthlyRecordsToServer();
       }
     }
 
@@ -3076,6 +3148,201 @@ void cleanupOldDailyFiles() {
   root.close();
   Serial.printf("\nSummary:\n  Deleted: %d\n  Kept: %d\n  Skipped: %d\n", deleted, kept, skipped);
   Serial.println("🧹 Cleanup done.\n");
+}
+
+// ================== SYNC MONTHLY RECORDS TO SERVER ==================
+bool syncMonthlyRecordsToServer() {
+  if (!sdMounted || !autoSyncEnabled || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  if (isSyncing) {
+    Serial.println("⚠️ Sync already in progress...");
+    return false;
+  }
+
+  isSyncing = true;
+  Serial.println("\n🔄 Starting auto sync with server...");
+
+  // Get current month
+  DateTime now = rtc.now();
+  char monthlyFilename[32];
+  sprintf(monthlyFilename, "%s%04d_%02d.csv",
+          MONTHLY_LOG_PREFIX, now.year(), now.month());
+
+  if (!SD.exists(monthlyFilename)) {
+    Serial.println("📁 No monthly file to sync");
+    isSyncing = false;
+    return false;
+  }
+
+  File file = SD.open(monthlyFilename, FILE_READ);
+  if (!file) {
+    Serial.println("❌ Failed to open monthly file");
+    isSyncing = false;
+    return false;
+  }
+
+  // Skip header
+  String header = file.readStringUntil('\n');
+
+  int totalRecords = 0;
+  int syncedRecords = 0;
+  int failedRecords = 0;
+
+  // Temporary file for unsynced records
+  char tempFilename[32];
+  sprintf(tempFilename, "%s%04d_%02d_temp.csv",
+          MONTHLY_LOG_PREFIX, now.year(), now.month());
+
+  File tempFile = SD.open(tempFilename, FILE_WRITE);
+  if (!tempFile) {
+    Serial.println("❌ Failed to create temp file");
+    file.close();
+    isSyncing = false;
+    return false;
+  }
+
+  // Write header to temp file
+  tempFile.println(header);
+
+  // Process each record
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    totalRecords++;
+
+    // Parse CSV line
+    int commaIndex = 0;
+    int startPos = 0;
+    int fieldIndex = 0;
+
+    String timestamp, cardUuid, userId, userName, recordType, status, message, dayOfWeek, checkInWindow, checkOutWindow;
+
+    while (startPos < line.length()) {
+      commaIndex = line.indexOf(',', startPos);
+      if (commaIndex == -1) commaIndex = line.length();
+
+      String field = line.substring(startPos, commaIndex);
+
+      switch (fieldIndex) {
+        case 0: timestamp = field; break;
+        case 1: cardUuid = field; break;
+        case 2: userId = field; break;
+        case 3: userName = field; break;
+        case 4: recordType = field; break;
+        case 5: status = field; break;
+        case 6: message = field; break;
+        case 7: dayOfWeek = field; break;
+        case 8: checkInWindow = field; break;
+        case 9: checkOutWindow = field; break;
+      }
+
+      startPos = commaIndex + 1;
+      fieldIndex++;
+    }
+
+    // Send to server
+    bool sent = sendAttendanceRecordToServer(
+      cardUuid,
+      userId.toInt(),
+      userName,
+      timestamp,
+      recordType,
+      status,
+      message,
+      dayOfWeek,
+      checkInWindow,
+      checkOutWindow);
+
+    if (sent) {
+      syncedRecords++;
+      Serial.printf("✅ Synced: %s - %s\n", timestamp.c_str(), cardUuid.c_str());
+      // Don't write to temp file (delete from monthly)
+    } else {
+      failedRecords++;
+      Serial.printf("❌ Failed: %s - %s\n", timestamp.c_str(), cardUuid.c_str());
+      // Keep in temp file (retry later)
+      tempFile.println(line);
+    }
+
+    delay(100);  // Small delay to avoid overwhelming server
+  }
+
+  file.close();
+  tempFile.close();
+
+  // Replace original with temp file (only failed records remain)
+  SD.remove(monthlyFilename);
+  if (failedRecords > 0) {
+    SD.rename(tempFilename, monthlyFilename);
+    Serial.printf("📁 %d failed records kept for retry\n", failedRecords);
+  } else {
+    SD.remove(tempFilename);
+    Serial.println("📁 All records synced, monthly file deleted");
+  }
+
+  Serial.printf("🔄 Sync complete: %d/%d synced, %d failed\n",
+                syncedRecords, totalRecords, failedRecords);
+
+  isSyncing = false;
+  return syncedRecords > 0;
+}
+
+// ================== SEND SINGLE ATTENDANCE RECORD TO SERVER ==================
+bool sendAttendanceRecordToServer(
+  const String& cardUuid,
+  int userId,
+  const String& userName,
+  const String& timestamp,
+  const String& recordType,
+  const String& status,
+  const String& message,
+  const String& dayOfWeek,
+  const String& checkInWindow,
+  const String& checkOutWindow) {
+
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  WiFiClient client;
+
+  String url = String(SERVER_URL) + "/api/v1/device/attendance/sync-record";
+  http.begin(client, url);
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_UUID);
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+
+  // EXACT payload as per your server requirement
+  DynamicJsonDocument doc(512);
+  doc["cardUuid"] = cardUuid;
+  doc["deviceUuid"] = DEVICE_UUID;
+  doc["userId"] = userId;
+  doc["userName"] = userName;
+  doc["timestamp"] = timestamp;
+  doc["recordType"] = recordType;
+  doc["status"] = status;
+  doc["message"] = message;
+  doc["dayOfWeek"] = dayOfWeek;
+  doc["checkInWindow"] = checkInWindow;
+  doc["checkOutWindow"] = checkOutWindow;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+
+  if (code == 200) {
+    http.end();
+    return true;
+  } else {
+    Serial.printf("Server returned: %d\n", code);
+    http.end();
+    return false;
+  }
 }
 
 // ================== LED FUNCTIONS ==================
