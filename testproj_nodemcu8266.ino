@@ -1820,92 +1820,6 @@ void setup() {
 
 
   // ================== SD CARD INIT ==================
-  // if (localStorage || !localStorage) {
-  //   Serial.println("Trying to mount SD card...");
-
-  //   // Pehle SPI bus ko clean karo
-  //   SPI.end();
-  //   delay(50);
-
-  //   // CS pin ko explicitly high kar do (safety)
-  //   pinMode(SD_CS_PIN, OUTPUT);
-  //   digitalWrite(SD_CS_PIN, HIGH);
-  //   delay(20);
-
-  //   // 2-3 baar try karo with delay
-  //   sdMounted = false;
-  //   for (int attempt = 1; attempt <= 3; attempt++) {
-  //     Serial.printf("  Attempt %d ... ", attempt);
-  //     sdMounted = SD.begin(SD_CS_PIN);
-  //     if (sdMounted) {
-  //       Serial.println("SUCCESS ✓");
-  //       break;
-  //     }
-  //     Serial.println("failed");
-  //     delay(300);  // important delay
-  //     SPI.end();   // reset SPI
-  //     delay(50);
-  //   }
-
-  //   if (!sdMounted) {
-  //     Serial.println("\n❌ SD Card mount failed after 3 attempts");
-  //     // Yahan restart kar sakte ho ya warning LED blink
-  //     delay(5000);
-  //     ESP.restart();  // ← abhi comment kar do, pehle test karo
-  //   } else {
-  //     Serial.println("✅ SD Card mounted successfully");
-  //   }
-  // } else {
-  //   sdMounted = false;
-  //   Serial.println("Local storage disabled — SD card skipped");
-  // }
-  // ================== SD CARD INIT ==================
-  // if (localStorage) {
-  //   Serial.println("Trying to mount SD card...");
-
-  //   sdMounted = false;
-  //   for (int attempt = 1; attempt <= 5; attempt++) {  // 5 attempts
-  //     Serial.printf("  Attempt %d ... ", attempt);
-
-  //     // CS pin high (inactive)
-  //     pinMode(SD_CS_PIN, OUTPUT);
-  //     digitalWrite(SD_CS_PIN, HIGH);
-  //     delay(50);
-
-  //     // SPI restart
-  //     SPI.end();
-  //     delay(50);
-  //     SPI.begin();
-
-  //     // SD begin
-  //     if (SD.begin(SD_CS_PIN)) {
-  //       sdMounted = true;
-  //       Serial.println("SUCCESS ✓");
-  //       break;
-  //     }
-
-  //     Serial.println("failed");
-  //     delay(500);  // extra wait before retry
-  //   }
-
-  //   if (!sdMounted) {
-  //     Serial.println("\n❌ SD Card mount failed after 5 attempts");
-  //     // Yahan aap blinkRedLong() ya sirf warning de kar continue kar sakte ho
-  //     // Abhi restart nahi karte, taake device offline mode mein kaam kare
-  //     // Sirf SD ke bina attendance memory mein store nahi hogi (optional)
-  //   } else {
-  //     Serial.println("✅ SD Card mounted successfully");
-  //     // Load schedules from SD
-  //     if (loadScheduleFromSD()) {
-  //       Serial.println("Using stored schedules from SD card");
-  //       isInitialScheduleLoaded = true;
-  //     }
-  //   }
-  // } else {
-  //   sdMounted = false;
-  //   Serial.println("Local storage disabled — SD card skipped");
-  // }
-  // 🔹 SD CARD ALWAYS INIT ON BOOT
   Serial.println("Initializing SD card...");
 
   pinMode(SD_CS_PIN, OUTPUT);
@@ -1965,46 +1879,15 @@ void setup() {
   // WHITE LED ON (Booting status)
   pcf.write(WHITE_LED_PIN, HIGH);
 
-  // CLEAN WIFI STATE
-  WiFi.disconnect(true);
-  delay(100);
   WiFi.mode(WIFI_STA);
-  delay(100);
+  WiFi.begin();
 
   // RFID INITIALIZE
   SPI.begin();
   rfid.PCD_Init();
   Serial.println("RFID Module Initialized");
 
-  // WIFI MANAGER SETUP
-  wifiManager.setDebugOutput(false);
-  wifiManager.setShowInfoErase(false);
-  wifiManager.setShowInfoUpdate(false);
-
-  std::vector<const char*> menu = { "wifi", "exit" };
-  wifiManager.setMenu(menu);
-
-  wifiManager.setAPCallback([](WiFiManager* wm) {
-    Serial.println("Config Portal Started");
-    reprovisionMode = true;
-    // Config portal mein white LED still ON
-    pcf.write(WHITE_LED_PIN, HIGH);
-  });
-
-  wifiManager.setConnectTimeout(30);        // 30 seconds connection try
-  wifiManager.setConfigPortalTimeout(180);  // 3 minutes portal timeout
-
   Serial.println("Attempting WiFi connection...");
-
-  // CONNECT TO WIFI
-  if (!wifiManager.autoConnect("RFID_Device_001", "12345678")) {
-    Serial.println("WiFi connection failed! Auto-restarting...");
-
-    // 5 seconds wait aur phir restart
-    delay(5000);
-    ESP.restart();  // AUTO RESTART - NO BUTTON NEEDED
-    delay(5000);
-  }
 
   // SUCCESS - WiFi connected
   Serial.println("WiFi Connected!");
@@ -2061,16 +1944,17 @@ void setup() {
 // ================== LOOP ==================
 void loop() {
 
-  static unsigned long lastRFIDCheck = 0;
-  if (millis() - lastRFIDCheck >= 30) {  // har ~30 ms check
-    lastRFIDCheck = millis();
+  unsigned long currentMillis = millis();
 
-    if (rfid.PICC_IsNewCardPresent()) {
-      if (rfid.PICC_ReadCardSerial()) {
-        handleRFID();
-        // Important: yahan thoda delay rakh sakte ho anti-repeat ke liye
-        delay(200);  // ya 150–250 ms
-      }
+  // ================== RFID CHECK - ALWAYS RUN ==================
+  // RFID ko hamesha check karo, WiFi status se independent
+  static unsigned long lastRFIDCheck = 0;
+  if (currentMillis - lastRFIDCheck >= 50) {  // Har 50ms check
+    lastRFIDCheck = currentMillis;
+
+    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+      handleRFID();  // Ye call hamesha hoga
+      delay(200);    // Thoda delay anti-spam ke liye
     }
   }
 
@@ -2088,17 +1972,6 @@ void loop() {
 
   // ----------------- BLUE LED (SERVER STATUS) -----------------
   pcf.write(BLUE_LED_PIN, serverUnreachable ? HIGH : LOW);
-
-  // ----------------- PERIODIC SCHEDULE UPDATE -----------------
-  // if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
-  //   server.handleClient();
-  //   if (localStorage) {
-  //     if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
-  //       fetchAndStoreSchedules();
-  //       lastScheduleUpdate = millis();
-  //     }
-  //   }
-  // }
 
   // ----------------- DAY CHANGE CHECK (every 10 sec) -----------------
   static unsigned long lastDayCheck = 0;
@@ -2122,33 +1995,35 @@ void loop() {
 
     server.handleClient();
 
-    if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
+    if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
       sendHeartbeat();
-      lastHeartbeatTime = millis();
+      lastHeartbeatTime = currentMillis;
     }
 
     if (localStorage) {
-      if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
+      if (currentMillis - lastScheduleUpdate >= scheduleUpdateInterval) {
         fetchAndStoreSchedules();
-        lastScheduleUpdate = millis();
+        lastScheduleUpdate = currentMillis;
       }
     }
+
   } else {
-    // WiFi disconnected – reconnect logic
-    wifiFailCount++;
-    if (wifiFailCount > 10) {
-      Serial.println("WiFi disconnected. Attempting reconnect...");
-      WiFi.reconnect();
-      delay(5000);
-      if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnectAttempt = 0;
+    if (currentMillis - lastReconnectAttempt >= 30000) {  // Har 30 sec try
+      lastReconnectAttempt = currentMillis;
+
+      wifiFailCount++;
+      Serial.printf("WiFi disconnected. Attempt %d to reconnect...\n", wifiFailCount);
+
+      WiFi.reconnect();  // Non-blocking call
+
+      if (wifiFailCount >= FAIL_LIMIT) {
         checkReprovision();
-      } else {
-        wifiFailCount = 0;
       }
     }
   }
 
-  delay(30);
+  delay(10);
 }
 
 // ================== HEARTBEAT ==================
