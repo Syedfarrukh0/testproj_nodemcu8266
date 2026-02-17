@@ -44,10 +44,10 @@ PCF8574 pcf(PCF_ADDRESS);
 int manualYear = 2026;
 int manualMonth = 2;
 int manualDay = 10;
-// int manualHour = 2;
-int manualHour = 18;
-// int manualMinute = 10;
-int manualMinute = 59;
+int manualHour = 2;
+// int manualHour = 18;
+int manualMinute = 10;
+// int manualMinute = 59;
 int manualSecond = 0;
 
 // ================== ATTENDANCE LOGIC HEADER ==================
@@ -1315,6 +1315,108 @@ void testSDCardReading() {
   Serial.println("============================================\n");
 }
 
+// ================== HANDLE RFID ===================
+void handleRFID() {
+  String cardUuid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    cardUuid += String(rfid.uid.uidByte[i], HEX);
+  }
+  cardUuid.toUpperCase();
+  Serial.println("Card scanned: " + cardUuid);
+
+  if (localStorage) {
+    // ----- LOCAL MODE (attendance on SD, WiFi not needed) -----
+    if (userSchedules.size() == 0) {
+      Serial.println("No schedules loaded – cannot accept any card");
+      blinkRedTwice();
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      delay(1200);
+      return;
+    }
+
+    // Check if card exists in any schedule
+    bool foundInSchedule = false;
+    for (const auto& schedule : userSchedules) {
+      if (schedule.cardUuid == cardUuid) {
+        foundInSchedule = true;
+        break;
+      }
+    }
+    if (!foundInSchedule) {
+      Serial.println("Card not found in local schedule");
+      blinkRedTwice();
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      delay(1200);
+      return;
+    }
+
+    // Get current time and day
+    DateTime currentTime = getLocalTime();
+    int currentDOW = currentTime.dayOfTheWeek();
+    currentDOW = (currentDOW == 0) ? 7 : currentDOW;
+
+    // Find today's schedule for this card
+    const UserSchedule* todaysSchedule = nullptr;
+    for (const auto& schedule : userSchedules) {
+      if (schedule.cardUuid == cardUuid && schedule.dayOfWeek == currentDOW) {
+        todaysSchedule = &schedule;
+        break;
+      }
+    }
+    if (!todaysSchedule) {
+      Serial.println("❌ No schedule found for today");
+      blinkRedTwice();
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      delay(1200);
+      return;
+    }
+
+    AttendanceResult localResult = processLocalAttendance(
+      cardUuid,
+      todaysSchedule->userId,
+      todaysSchedule->userName,
+      *todaysSchedule,
+      currentTime);
+
+    if (localResult.success) {
+      blinkGreenOnce();
+      Serial.println("✅ LOCAL ATTENDANCE ACCEPTED: " + localResult.message);
+      const char* days[] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+      saveAttendanceLogToSD(
+        cardUuid,
+        todaysSchedule->userId,
+        todaysSchedule->userName,
+        localResult.timestamp,
+        localResult.recordType,
+        localResult.status,
+        localResult.message,
+        String(days[currentDOW - 1]),
+        todaysSchedule->checkInFrom + " - " + todaysSchedule->checkInTo,
+        todaysSchedule->checkOutFrom + " - " + todaysSchedule->checkOutTo);
+    } else {
+      blinkRedTwice();
+      Serial.println("❌ LOCAL ATTENDANCE DENIED: " + localResult.message);
+    }
+  } else {
+    // ----- ONLINE MODE (server attendance) -----
+    if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
+      bool accepted = sendAttendance(cardUuid);
+      if (accepted) blinkGreenOnce();
+      else blinkRedTwice();
+    } else {
+      Serial.println("WiFi not connected – cannot send attendance to server");
+      blinkRedTwice();
+    }
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  delay(1200);  // anti double‑tap
+}
+
 // ================== HANDLE DELETE MONTHLY RECORDS ==================
 void handleDeleteMonthlyRecords() {
   // Authentication check
@@ -1718,45 +1820,121 @@ void setup() {
 
 
   // ================== SD CARD INIT ==================
-  if (localStorage || !localStorage) {
-    Serial.println("Trying to mount SD card...");
+  // if (localStorage || !localStorage) {
+  //   Serial.println("Trying to mount SD card...");
 
-    // Pehle SPI bus ko clean karo
-    SPI.end();
-    delay(50);
+  //   // Pehle SPI bus ko clean karo
+  //   SPI.end();
+  //   delay(50);
 
-    // CS pin ko explicitly high kar do (safety)
-    pinMode(SD_CS_PIN, OUTPUT);
-    digitalWrite(SD_CS_PIN, HIGH);
-    delay(20);
+  //   // CS pin ko explicitly high kar do (safety)
+  //   pinMode(SD_CS_PIN, OUTPUT);
+  //   digitalWrite(SD_CS_PIN, HIGH);
+  //   delay(20);
 
-    // 2-3 baar try karo with delay
+  //   // 2-3 baar try karo with delay
+  //   sdMounted = false;
+  //   for (int attempt = 1; attempt <= 3; attempt++) {
+  //     Serial.printf("  Attempt %d ... ", attempt);
+  //     sdMounted = SD.begin(SD_CS_PIN);
+  //     if (sdMounted) {
+  //       Serial.println("SUCCESS ✓");
+  //       break;
+  //     }
+  //     Serial.println("failed");
+  //     delay(300);  // important delay
+  //     SPI.end();   // reset SPI
+  //     delay(50);
+  //   }
+
+  //   if (!sdMounted) {
+  //     Serial.println("\n❌ SD Card mount failed after 3 attempts");
+  //     // Yahan restart kar sakte ho ya warning LED blink
+  //     delay(5000);
+  //     ESP.restart();  // ← abhi comment kar do, pehle test karo
+  //   } else {
+  //     Serial.println("✅ SD Card mounted successfully");
+  //   }
+  // } else {
+  //   sdMounted = false;
+  //   Serial.println("Local storage disabled — SD card skipped");
+  // }
+  // ================== SD CARD INIT ==================
+  // if (localStorage) {
+  //   Serial.println("Trying to mount SD card...");
+
+  //   sdMounted = false;
+  //   for (int attempt = 1; attempt <= 5; attempt++) {  // 5 attempts
+  //     Serial.printf("  Attempt %d ... ", attempt);
+
+  //     // CS pin high (inactive)
+  //     pinMode(SD_CS_PIN, OUTPUT);
+  //     digitalWrite(SD_CS_PIN, HIGH);
+  //     delay(50);
+
+  //     // SPI restart
+  //     SPI.end();
+  //     delay(50);
+  //     SPI.begin();
+
+  //     // SD begin
+  //     if (SD.begin(SD_CS_PIN)) {
+  //       sdMounted = true;
+  //       Serial.println("SUCCESS ✓");
+  //       break;
+  //     }
+
+  //     Serial.println("failed");
+  //     delay(500);  // extra wait before retry
+  //   }
+
+  //   if (!sdMounted) {
+  //     Serial.println("\n❌ SD Card mount failed after 5 attempts");
+  //     // Yahan aap blinkRedLong() ya sirf warning de kar continue kar sakte ho
+  //     // Abhi restart nahi karte, taake device offline mode mein kaam kare
+  //     // Sirf SD ke bina attendance memory mein store nahi hogi (optional)
+  //   } else {
+  //     Serial.println("✅ SD Card mounted successfully");
+  //     // Load schedules from SD
+  //     if (loadScheduleFromSD()) {
+  //       Serial.println("Using stored schedules from SD card");
+  //       isInitialScheduleLoaded = true;
+  //     }
+  //   }
+  // } else {
+  //   sdMounted = false;
+  //   Serial.println("Local storage disabled — SD card skipped");
+  // }
+  // 🔹 SD CARD ALWAYS INIT ON BOOT
+  Serial.println("Initializing SD card...");
+
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  SPI.begin();
+
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("❌ SD Card init failed");
     sdMounted = false;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-      Serial.printf("  Attempt %d ... ", attempt);
-      sdMounted = SD.begin(SD_CS_PIN);
-      if (sdMounted) {
-        Serial.println("SUCCESS ✓");
-        break;
-      }
-      Serial.println("failed");
-      delay(300);  // important delay
-      SPI.end();   // reset SPI
-      delay(50);
-    }
-
-    if (!sdMounted) {
-      Serial.println("\n❌ SD Card mount failed after 3 attempts");
-      // Yahan restart kar sakte ho ya warning LED blink
-      delay(5000);
-      ESP.restart();  // ← abhi comment kar do, pehle test karo
-    } else {
-      Serial.println("✅ SD Card mounted successfully");
-    }
   } else {
-    sdMounted = false;
-    Serial.println("Local storage disabled — SD card skipped");
+    Serial.println("✅ SD Card initialized");
+    sdMounted = true;
+
+    // 🔹 Schedule only if localStorage enabled
+    if (localStorage) {
+      Serial.println("Local storage enabled — loading schedule");
+
+      if (loadScheduleFromSD()) {
+        Serial.println("📅 Schedule loaded from SD");
+        isInitialScheduleLoaded = true;
+      } else {
+        Serial.println("⚠️ No schedule found on SD");
+      }
+    } else {
+      Serial.println("Local storage disabled — SD mounted but schedule skipped");
+    }
   }
+
 
   // ================== LOAD SCHEDULE FROM SD ==================
   if (localStorage && sdMounted) {
@@ -1883,6 +2061,19 @@ void setup() {
 // ================== LOOP ==================
 void loop() {
 
+  static unsigned long lastRFIDCheck = 0;
+  if (millis() - lastRFIDCheck >= 30) {  // har ~30 ms check
+    lastRFIDCheck = millis();
+
+    if (rfid.PICC_IsNewCardPresent()) {
+      if (rfid.PICC_ReadCardSerial()) {
+        handleRFID();
+        // Important: yahan thoda delay rakh sakte ho anti-repeat ke liye
+        delay(200);  // ya 150–250 ms
+      }
+    }
+  }
+
   // ----------------- WHITE LED STATUS -----------------
   if (reprovisionMode) {
     // Config portal mode - White LED ON (still)
@@ -1899,16 +2090,17 @@ void loop() {
   pcf.write(BLUE_LED_PIN, serverUnreachable ? HIGH : LOW);
 
   // ----------------- PERIODIC SCHEDULE UPDATE -----------------
-  if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
-    server.handleClient();
-    if (localStorage) {
-      if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
-        fetchAndStoreSchedules();
-        lastScheduleUpdate = millis();
-      }
-    }
-  }
+  // if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
+  //   server.handleClient();
+  //   if (localStorage) {
+  //     if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
+  //       fetchAndStoreSchedules();
+  //       lastScheduleUpdate = millis();
+  //     }
+  //   }
+  // }
 
+  // ----------------- DAY CHANGE CHECK (every 10 sec) -----------------
   static unsigned long lastDayCheck = 0;
   if (millis() - lastDayCheck >= 10000) {  // Har 10 seconds
     lastDayCheck = millis();
@@ -1918,139 +2110,36 @@ void loop() {
     }
   }
 
+  // ----------------- RFID ATTENDANCE -----------------
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    handleRFID();
+  }
+
   // ----------------- HEARTBEAT + WIFI SCAN -----------------
   if (WiFi.status() == WL_CONNECTED && !reprovisionMode) {
     wifiFailCount = 0;
     isConnecting = false;
+
+    server.handleClient();
 
     if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
       sendHeartbeat();
       lastHeartbeatTime = millis();
     }
 
-    // ----------------- RFID ATTENDANCE -----------------
-    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      String cardUuid = "";
-      for (byte i = 0; i < rfid.uid.size; i++) {
-        cardUuid += String(rfid.uid.uidByte[i], HEX);
+    if (localStorage) {
+      if (millis() - lastScheduleUpdate >= scheduleUpdateInterval) {
+        fetchAndStoreSchedules();
+        lastScheduleUpdate = millis();
       }
-      cardUuid.toUpperCase();
-
-      Serial.println("Card scanned: " + cardUuid);
-
-      // First check in local schedule (if localstorage is enabled)
-      if (localStorage && userSchedules.size() > 0) {
-        bool foundInSchedule = false;
-        for (const auto& schedule : userSchedules) {
-          if (schedule.cardUuid == cardUuid) {
-            foundInSchedule = true;
-            Serial.println("User found in local schedule: " + schedule.userName);
-            break;
-          }
-        }
-
-        if (!foundInSchedule) {
-          Serial.println("Card not found in local schedule");
-          blinkRedTwice();
-          rfid.PICC_HaltA();
-          rfid.PCD_StopCrypto1();
-          delay(1200);
-          return;
-        }
-      }
-
-      // ========== 🔥 YAHAN SE NAYA CODE ADD KARO 🔥 ==========
-      if (localStorage) {
-        // Day change check
-        DateTime currentTime = getLocalTime();
-        checkDayChange(currentTime);
-
-        // Get current day of week (1=Monday, 7=Sunday)
-        int currentDOW = currentTime.dayOfTheWeek();
-        currentDOW = (currentDOW == 0) ? 7 : currentDOW;
-
-        Serial.println("\n=== ATTENDANCE CHECK ===");
-        Serial.println("Card: " + cardUuid);
-        Serial.println("Today: Day " + String(currentDOW) + " (" + getDayName(currentDOW) + ")");
-        Serial.println("Local Time: " + String(currentTime.hour()) + ":" + String(currentTime.minute()) + ":" + String(currentTime.second()));
-
-        // 🔥 FIND SCHEDULE FOR TODAY - SIRF EK BAAR
-        const UserSchedule* todaysSchedule = nullptr;
-        for (const auto& schedule : userSchedules) {
-          if (schedule.cardUuid == cardUuid) {
-            Serial.println("  → Found schedule for Day " + String(schedule.dayOfWeek));
-            if (schedule.dayOfWeek == currentDOW) {
-              todaysSchedule = &schedule;
-              Serial.println("  ✅ This is TODAY's schedule!");
-              break;  // Mil gaya, loop se bahar
-            }
-          }
-        }
-
-        // Agar aaj ka schedule nahi mila
-        if (!todaysSchedule) {
-          Serial.println("❌ No schedule found for today (Day " + String(currentDOW) + ")");
-          blinkRedTwice();
-          rfid.PICC_HaltA();
-          rfid.PCD_StopCrypto1();
-          delay(1200);
-          return;
-        }
-
-        // 🔥 PROCESS WITH EXACT SERVER LOGIC - SIRF EK BAAR
-        AttendanceResult localResult = processLocalAttendance(
-          cardUuid,
-          todaysSchedule->userId,
-          todaysSchedule->userName,
-          *todaysSchedule,
-          currentTime);
-
-        if (localResult.success) {
-          blinkGreenOnce();
-          Serial.println("✅ LOCAL ATTENDANCE ACCEPTED: " + localResult.message);
-
-          // Save to SD card log
-          const char* days[] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
-          saveAttendanceLogToSD(
-            cardUuid,
-            todaysSchedule->userId,
-            todaysSchedule->userName,
-            localResult.timestamp,
-            localResult.recordType,
-            localResult.status,
-            localResult.message,
-            String(days[currentDOW - 1]),
-            todaysSchedule->checkInFrom + " - " + todaysSchedule->checkInTo,
-            todaysSchedule->checkOutFrom + " - " + todaysSchedule->checkOutTo);
-
-        } else {
-          blinkRedTwice();
-          Serial.println("❌ LOCAL ATTENDANCE DENIED: " + localResult.message);
-        }
-
-      } else {
-        // ----- EXISTING CODE - ONLINE MODE -----
-        bool accepted = sendAttendance(cardUuid);
-        if (accepted) blinkGreenOnce();
-        else blinkRedTwice();
-      }
-      // ========== 🔥 YAHAN TAK NAYA CODE 🔥 ==========
-
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
-      delay(1200);  // anti-double tap
     }
-
   } else {
-    // WiFi disconnected
+    // WiFi disconnected – reconnect logic
     wifiFailCount++;
-
-    // Try reconnecting after some failures
     if (wifiFailCount > 10) {
       Serial.println("WiFi disconnected. Attempting reconnect...");
       WiFi.reconnect();
       delay(5000);
-
       if (WiFi.status() != WL_CONNECTED) {
         checkReprovision();
       } else {
