@@ -1738,8 +1738,69 @@ void handleAutoSync() {
                 : "{\"success\":true,\"autoSync\":false}");
 }
 
+// ================== HANDLE MANUAL SYNC ==================
+void handleManualSync() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"message\":\"Method not allowed\"}");
+    return;
+  }
+
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
+  // Parse JSON body
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+  if (error) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+    return;
+  }
+
+  // Get year and month from request (optional)
+  int year = doc["year"] | 0;
+  int month = doc["month"] | 0;
+
+  // If not provided, use current
+  if (year == 0 || month == 0) {
+    DateTime now = rtc.now();
+    year = now.year();
+    month = now.month();
+  }
+
+  // Validate month
+  if (month < 1 || month > 12) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid month. Must be 1-12\"}");
+    return;
+  }
+
+  Serial.printf("🔄 Manual sync triggered for %04d-%02d\n", year, month);
+
+  // Call sync function
+  bool result = syncMonthlyRecordsToServer();
+
+  if (result) {
+    server.send(200, "application/json",
+                "{\"success\":true,\"message\":\"Sync completed successfully\"}");
+  } else {
+    server.send(200, "application/json",
+                "{\"success\":false,\"message\":\"No records to sync or sync failed\"}");
+  }
+}
+
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
+
   server.collectHeaders(
     "x-device-id",
     "x-device-secret");
@@ -1759,6 +1820,7 @@ void setupServer() {
   server.on("/api/attendance/files", HTTP_GET, handleListFiles);
 
   server.on("/api/auto-sync", HTTP_POST, handleAutoSync);
+  server.on("/api/attendance/sync", HTTP_POST, handleManualSync);
 
   server.begin();
   Serial.println("HTTP server started");
@@ -2111,11 +2173,12 @@ void sendHeartbeat() {
   doc["status"] = "connected";
   doc["ip"] = WiFi.localIP().toString();
   doc["schedulesLoaded"] = userSchedules.size();
+  doc["autoSyncEnabled"] = autoSyncEnabled;
 
   // ================== SD CARD STATUS ==================
   JsonObject sd = doc.createNestedObject("sd");
   sd["enabled"] = localStorage;
-  sd["mounted"] = localStorage ? sdMounted : false;
+  sd["mounted"] = sdMounted ? true : false;
   sd["scheduleFileExists"] = (localStorage && sdMounted) ? SD.exists(SCHEDULE_FILE) : false;
 
   String payload;
@@ -2434,7 +2497,6 @@ bool loadScheduleFromSD() {
 
 // ================== LOCAL ATTENDANCE HELPER FUNCTIONS ==================
 // Server logic ka exact replica
-
 int timeToSeconds(const String& timeStr) {
   if (timeStr.length() == 0 || timeStr == "Invalid Date" || timeStr == "null") {
     return 0;
