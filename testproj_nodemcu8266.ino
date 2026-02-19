@@ -38,7 +38,7 @@ PCF8574 pcf(PCF_ADDRESS);
 #define SS_PIN D4
 
 // ================== TESTING CONFIG ==================
-#define USE_NTP_TIME false
+#define USE_NTP_TIME true  // if you are use in testing for use manual time so, Use_NTP_TIME false
 
 // ================== MANUAL TIME FOR TESTING ==================
 // Sirf tab use hoga jab USE_NTP_TIME = false ho
@@ -236,6 +236,17 @@ uint32_t calculateCRC32(const uint8_t* data, size_t length) {
     }
   }
   return ~crc;
+}
+
+// ================== FIND USER SCHEDULE BY ID AND DAY ==================
+bool findUserSchedule(int userId, int dayOfWeek, UserSchedule*& foundSchedule) {
+  for (auto& schedule : userSchedules) {
+    if (schedule.userId == userId && schedule.dayOfWeek == dayOfWeek) {
+      foundSchedule = &schedule;
+      return true;
+    }
+  }
+  return false;
 }
 
 // ================== SCHEDULE MANAGEMENT ==================
@@ -1233,6 +1244,53 @@ String listAllLogFiles() {
   return response;
 }
 
+// ================== GET SCHEDULES FROM MEMORY - FIXED ==================
+String getSchedulesFromMemory() {
+  DynamicJsonDocument doc(8192);
+
+  // Create users array
+  JsonArray users = doc.createNestedArray("users");
+
+  // Simple duplicate check using array
+  const int MAX_SCHEDULES = 50;
+  String seenKeys[MAX_SCHEDULES];
+  int seenCount = 0;
+
+  for (auto& u : userSchedules) {
+    // Create unique key
+    String key = String(u.userId) + "_" + String(u.dayOfWeek);
+
+    // Check if already seen
+    bool found = false;
+    for (int i = 0; i < seenCount; i++) {
+      if (seenKeys[i] == key) {
+        found = true;
+        break;
+      }
+    }
+
+    if (!found && seenCount < MAX_SCHEDULES) {
+      seenKeys[seenCount++] = key;
+
+      JsonObject user = users.createNestedObject();
+      user["id"] = u.userId;
+      user["cardUuid"] = u.cardUuid;
+      user["name"] = u.userName;
+      user["dayOfWeek"] = u.dayOfWeek;
+      user["checkInFrom"] = u.checkInFrom;
+      user["checkInTo"] = u.checkInTo;
+      user["checkOutFrom"] = u.checkOutFrom;
+      user["checkOutTo"] = u.checkOutTo;
+    }
+  }
+
+  // Create final response
+  String response;
+  serializeJson(doc, response);
+
+  return response;
+}
+
 // ================== HANDLE LIST FILES ==================
 void handleListFiles() {
   // Authentication check
@@ -1798,6 +1856,144 @@ void handleManualSync() {
   }
 }
 
+// ================== SYNC USER SCHEDULE ==================
+void handleSyncUserSchedule() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"message\":\"Method not allowed\"}");
+    return;
+  }
+
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"error\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"error\":\"Invalid device auth\"}");
+    return;
+  }
+
+  // Parse JSON body
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+  if (error) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+    return;
+  }
+
+  // Check if it's a user update or full replacement
+  bool replaceAll = doc["replaceAll"] | false;
+
+  if (replaceAll) {
+    // Full replacement - clear all and add new
+    userSchedules.clear();
+  }
+
+  // Parse users array
+  JsonArray users = doc["users"];
+  int addedCount = 0;
+  int updatedCount = 0;
+
+  for (JsonObject user : users) {
+    int userId = user["userId"] | 0;
+    String cardUuid = user["cardUuid"].as<String>();
+    String userName = user["userName"].as<String>();
+    JsonArray schedules = user["schedules"];
+
+    if (userId == 0) continue;
+
+    // Agar replaceAll true hai to hume existing schedules check nahi karne
+    if (!replaceAll) {
+      // Delete all existing schedules for this user (optional - depends on requirement)
+      // deleteAllUserSchedules(userId);
+    }
+
+    for (JsonObject sched : schedules) {
+      int dayOfWeek = sched["dayOfWeek"] | 0;
+      if (dayOfWeek == 0) continue;
+
+      // Check if exists
+      UserSchedule* existing = nullptr;
+      bool exists = findUserSchedule(userId, dayOfWeek, existing);
+
+      if (exists && !replaceAll) {
+        // Update existing
+        existing->cardUuid = cardUuid;
+        existing->userName = userName;
+        existing->checkInFrom = sched["checkInFrom"].as<String>();
+        existing->checkInTo = sched["checkInTo"].as<String>();
+        existing->checkOutFrom = sched["checkOutFrom"].as<String>();
+        existing->checkOutTo = sched["checkOutTo"].as<String>();
+        updatedCount++;
+      } else {
+        // Add new
+        UserSchedule newSched;
+        newSched.userId = userId;
+        newSched.cardUuid = cardUuid;
+        newSched.userName = userName;
+        newSched.dayOfWeek = dayOfWeek;
+        newSched.checkInFrom = sched["checkInFrom"].as<String>();
+        newSched.checkInTo = sched["checkInTo"].as<String>();
+        newSched.checkOutFrom = sched["checkOutFrom"].as<String>();
+        newSched.checkOutTo = sched["checkOutTo"].as<String>();
+
+        userSchedules.push_back(newSched);
+        addedCount++;
+      }
+    }
+  }
+
+  // Save to SD
+  if (localStorage && sdMounted) {
+    saveScheduleToSD();
+  }
+
+  Serial.printf("✅ Bulk sync complete: %d added, %d updated\n", addedCount, updatedCount);
+
+  String response = "{\"success\":true,\"message\":\"Bulk sync completed\",";
+  response += "\"added\":" + String(addedCount) + ",";
+  response += "\"updated\":" + String(updatedCount) + "}";
+
+  server.send(200, "application/json", response);
+}
+
+// ================== HANDLE GET DEVICE SCHEDULES ==================
+void handleGetDeviceSchedules() {
+  // Authentication check
+  if (!server.hasHeader("x-device-id") || !server.hasHeader("x-device-secret")) {
+    server.send(401, "application/json", "{\"success\":false,\"message\":\"Missing auth headers\"}");
+    return;
+  }
+
+  String deviceId = server.header("x-device-id");
+  String deviceSecret = server.header("x-device-secret");
+
+  if (deviceId != DEVICE_UUID || deviceSecret != DEVICE_SECRET) {
+    server.send(403, "application/json", "{\"success\":false,\"message\":\"Invalid device credentials\"}");
+    return;
+  }
+
+  Serial.println("\n📋 ===== HANDLING GET SCHEDULES REQUEST =====");
+
+  String response;
+
+  // 🔥 Option 1: Memory se bhejein (fastest & most reliable)
+  // response = getSchedulesFromMemory();
+
+  // 🔥 Option 2: Agar SD se hi bhejna ho to:
+  response = getSchedulesFromMemory();
+
+  Serial.println("📤 Sending schedules response:");
+  Serial.println(response);
+  Serial.println("===========================================\n");
+
+  server.send(200, "application/json", response);
+}
+
 // ================== ESP SERVER SETUP ==================
 void setupServer() {
 
@@ -1821,6 +2017,10 @@ void setupServer() {
 
   server.on("/api/auto-sync", HTTP_POST, handleAutoSync);
   server.on("/api/attendance/sync", HTTP_POST, handleManualSync);
+
+  server.on("/api/attendance/schedule/sync", HTTP_POST, handleSyncUserSchedule);
+
+  server.on("/api/device/schedules", HTTP_GET, handleGetDeviceSchedules);
 
   server.begin();
   Serial.println("HTTP server started");
@@ -2072,6 +2272,7 @@ void setup() {
 // ================== LOOP ==================
 void loop() {
 
+  static bool rtcSynced = false;
   unsigned long currentMillis = millis();
 
   // ================== RFID CHECK - ALWAYS RUN ==================
@@ -2122,6 +2323,12 @@ void loop() {
     isConnecting = false;
 
     server.handleClient();
+
+    if (!rtcSynced) {
+      Serial.println("🕒 First WiFi connection - syncing RTC from NTP...");
+      setRTCFromNTP();
+      rtcSynced = true;
+    }
 
     if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
       sendHeartbeat();
