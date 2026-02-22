@@ -244,6 +244,17 @@ DateTime getLocalTime() {
   time_t utcUnix = utc.unixtime();
   time_t localUnix = utcUnix + totalOffsetSeconds;
   DateTime local = DateTime(localUnix);
+
+  //   // Debug output
+  // Serial.printf("🌍 UTC:  %04d-%02d-%02d %02d:%02d:%02d\n",
+  //               utc.year(), utc.month(), utc.day(),
+  //               utc.hour(), utc.minute(), utc.second());
+
+  // Serial.printf("📍 Local: %04d-%02d-%02d %02d:%02d:%02d (Offset: %d min)\n",
+  //               local.year(), local.month(), local.day(),
+  //               local.hour(), local.minute(), local.second(),
+  //               timezoneOffsetMinutes);
+
   return local;
 }
 
@@ -323,12 +334,20 @@ void publishHeartbeat() {
   sd["enabled"] = localStorage;
   sd["mounted"] = sdMounted;
   sd["scheduleFileExists"] = (localStorage && sdMounted) ? SD.exists(SCHEDULE_FILE) : false;
-  sd["checkIns"] = todaysCheckIns.size();
-  sd["checkOuts"] = todaysCheckOuts.size();
 
   String payload;
   serializeJson(doc, payload);
-  mqttClient.publish(MQTT_TOPIC_HEARTBEAT, payload.c_str());
+  bool published = mqttClient.publish(MQTT_TOPIC_HEARTBEAT, payload.c_str());
+
+  if (published) {
+    heartbeatFailCount = 0;
+    serverUnreachable = false;
+    Serial.println("✅ Heartbeat sent successfully");
+  } else {
+    heartbeatFailCount++;
+    Serial.println("❌ Heartbeat publish failed");
+    checkServerUnreachable();
+  }
 }
 
 // ================== MQTT CALLBACK ==================
@@ -1004,14 +1023,7 @@ void sendHeartbeat() {
 
   DynamicJsonDocument doc(256);
   doc["status"] = "connected";
-  doc["ip"] = WiFi.localIP().toString();
-  doc["schedulesLoaded"] = userSchedules.size();
-  doc["autoSyncEnabled"] = autoSyncEnabled;
-
-  JsonObject sd = doc.createNestedObject("sd");
-  sd["enabled"] = localStorage;
-  sd["mounted"] = sdMounted;
-  sd["scheduleFileExists"] = (localStorage && sdMounted) ? SD.exists(SCHEDULE_FILE) : false;
+  doc["timestamp"] = getLocalTime().unixtime();
 
   String payload;
   serializeJson(doc, payload);
@@ -1020,14 +1032,13 @@ void sendHeartbeat() {
   if (code == 200) {
     heartbeatFailCount = 0;
     serverUnreachable = false;
+    publishHeartbeat();
   } else {
     heartbeatFailCount++;
     checkServerUnreachable();
   }
 
   http.end();
-
-  publishHeartbeat();
 }
 
 // ================== RFID HANDLER ==================
@@ -1645,6 +1656,8 @@ bool loadScheduleFromSD() {
     s.checkOutTo = u["checkOutTo"].as<String>();
     userSchedules.push_back(s);
   }
+
+  Serial.println("✅ Loaded schedules from SD: " + String(userSchedules.size()));
 
   return true;
 }
@@ -2586,6 +2599,11 @@ void setup() {
     deviceTimezone = "UTC";
     timezoneOffsetMinutes = 0;
   }
+
+  Serial.printf(
+    "🌍 Timezone loaded: %s | Offset: %d minutes\n",
+    deviceTimezone.c_str(),
+    timezoneOffsetMinutes);
 
   Serial.println("Initializing SD card...");
 
