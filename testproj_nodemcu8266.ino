@@ -193,7 +193,7 @@ RTC_DS3231 rtc;
 // ================== FUNCTION PROTOTYPES ==================
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void handleMqttCommand(String command, JsonDocument& doc);
-void publishMqttResponse(bool success, String message);
+void publishMqttResponse(bool success, String message, String commandId = "");
 void publishMqttStatus(String status, String message);
 void publishHeartbeat();
 DateTime getLocalTime();
@@ -308,11 +308,15 @@ void publishMqttStatus(String status, String message) {
 }
 
 // ================== PUBLISH MQTT RESPONSE ==================
-void publishMqttResponse(bool success, String message) {
+void publishMqttResponse(bool success, String message, String commandId) {
   DynamicJsonDocument doc(256);
   doc["success"] = success;
   doc["message"] = message;
   doc["timestamp"] = getLocalTime().unixtime();
+
+  if (commandId.length() > 0) {
+    doc["commandId"] = commandId;
+  }
 
   String payload;
   serializeJson(doc, payload);
@@ -394,6 +398,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   Serial.println("Handling MQTT command: " + command);
 
   if (command == "get_status") {
+    String commandId = doc["commandId"] | "";
     publishMqttResponse(true, "Device status");
 
     DynamicJsonDocument data(256);
@@ -409,12 +414,19 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     data["todayCheckIns"] = todaysCheckIns.size();
     data["todayCheckOuts"] = todaysCheckOuts.size();
 
+    // ADD commandId if present
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
   else if (command == "scan_wifi") {
+    String commandId = doc["commandId"] | "";
+
     publishMqttResponse(true, "WiFi scan completed");
 
     int n = WiFi.scanNetworks();
@@ -430,6 +442,10 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       net["secure"] = (WiFi.encryptionType(i) != ENC_TYPE_NONE);
     }
 
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
     WiFi.scanDelete();
 
     String dataPayload;
@@ -438,6 +454,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "connect_wifi") {
+    String commandId = doc["commandId"] | "";
     String ssid = doc["ssid"] | "";
     String password = doc["password"] | "";
 
@@ -458,6 +475,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "toggle_local_storage") {
+    String commandId = doc["commandId"] | "";
+
     bool newValue = doc["enabled"] | localStorage;
 
     if (localStorage != newValue) {
@@ -479,6 +498,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
       DynamicJsonDocument data(64);
       data["localStorage"] = localStorage;
+
+      if (commandId.length() > 0) {
+        data["commandId"] = commandId;
+      }
+
       String dataPayload;
       serializeJson(data, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
@@ -490,6 +514,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
       DynamicJsonDocument data(64);
       data["localStorage"] = localStorage;
+
+      if (commandId.length() > 0) {
+        data["commandId"] = commandId;
+      }
+
       String dataPayload;
       serializeJson(data, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
@@ -497,6 +526,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "set_timezone") {
+    String commandId = doc["commandId"] | "";
+
     deviceTimezone = doc["timezone"] | "UTC";
     String offsetStr = doc["offset"] | "+00:00";
 
@@ -521,12 +552,19 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     DynamicJsonDocument data(64);
     data["timezone"] = deviceTimezone;
     data["offset"] = timezoneOffsetMinutes;
+
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
   else if (command == "get_attendance_records") {
+    String commandId = doc["commandId"] | "";
+
     String cardUuid = doc["cardUuid"] | "";
     String response;
 
@@ -545,6 +583,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       JsonVariant data = respDoc["data"];
       DynamicJsonDocument dataDoc(1024);
       dataDoc["data"] = data;
+
+      if (commandId.length() > 0) {
+        dataDoc["commandId"] = commandId;
+      }
+
       String dataPayload;
       serializeJson(dataDoc, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
@@ -554,6 +597,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "delete_attendance_records") {
+    String commandId = doc["commandId"] | "";
     String cardUuid = doc["cardUuid"] | "";
 
     if (cardUuid.length() == 0) {
@@ -567,7 +611,16 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     deserializeJson(respDoc, response);
 
     if (respDoc["success"]) {
-      publishMqttResponse(true, respDoc["message"].as<String>());
+      DynamicJsonDocument data(128);
+      data["message"] = respDoc["message"];
+      if (commandId.length() > 0) {
+        data["commandId"] = commandId;
+      }
+      String dataPayload;
+      serializeJson(data, dataPayload);
+      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+      // publishMqttResponse(true, respDoc["message"].as<String>());
     } else {
       publishMqttResponse(false, respDoc["message"].as<String>());
     }
@@ -603,6 +656,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "get_monthly_records") {
+    String commandId = doc["commandId"] | "";
     int year = doc["year"] | 0;
     int month = doc["month"] | 0;
     String cardUuid = doc["cardUuid"] | "";
@@ -629,6 +683,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       JsonVariant data = respDoc["data"];
       DynamicJsonDocument dataDoc(1024);
       dataDoc["data"] = data;
+
+      if (commandId.length() > 0) {
+        dataDoc["commandId"] = commandId;
+      }
+
       String dataPayload;
       serializeJson(dataDoc, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
@@ -670,6 +729,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "list_files") {
+    String commandId = doc["commandId"] | "";
     String response = listAllLogFiles();
 
     DynamicJsonDocument respDoc(4096);
@@ -681,6 +741,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       JsonVariant data = respDoc["data"];
       DynamicJsonDocument dataDoc(2048);
       dataDoc["data"] = data;
+
+      if (commandId.length() > 0) {
+        dataDoc["commandId"] = commandId;
+      }
+
       String dataPayload;
       serializeJson(dataDoc, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
@@ -690,6 +755,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "toggle_auto_sync") {
+    String commandId = doc["commandId"] | "";
     bool newValue = doc["enabled"] | autoSyncEnabled;
 
     if (autoSyncEnabled != newValue) {
@@ -702,12 +768,18 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     DynamicJsonDocument data(64);
     data["autoSync"] = autoSyncEnabled;
+
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
   else if (command == "manual_sync") {
+    String commandId = doc["commandId"] | "";
     int year = doc["year"] | 0;
     int month = doc["month"] | 0;
 
@@ -720,13 +792,26 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     bool result = syncMonthlyRecordsToServer(year, month);
 
     if (result) {
-      publishMqttResponse(true, "Sync completed successfully");
+      DynamicJsonDocument data(64);
+      data["message"] = "Sync completed successfully";
+      // 🔥 ADD commandId if present
+      if (commandId.length() > 0) {
+        data["commandId"] = commandId;
+      }
+      String dataPayload;
+      serializeJson(data, dataPayload);
+      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+      // publishMqttResponse(true, "Sync completed successfully");
     } else {
       publishMqttResponse(false, "No records to sync or sync failed");
     }
   }
 
   else if (command == "sync_user_schedule") {
+    // 🔥 STEP 1: Get commandId from incoming message
+    String commandId = doc["commandId"] | "";
+
     bool replaceAll = doc["replaceAll"] | false;
 
     if (replaceAll) {
@@ -737,6 +822,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     int addedCount = 0;
     int updatedCount = 0;
 
+    Serial.printf("[ScheduleSync] Received %d users\n", users.size());
+    if (commandId.length() > 0) {
+      Serial.printf("[ScheduleSync] Command ID: %s\n", commandId.c_str());
+    }
+
     for (JsonObject user : users) {
       int userId = user["userId"] | 0;
       String cardUuid = user["cardUuid"] | "";
@@ -744,6 +834,9 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       JsonArray schedules = user["schedules"];
 
       if (userId == 0) continue;
+
+      Serial.printf("  User %d: %s, Card: %s, %d schedules\n",
+                    userId, userName.c_str(), cardUuid.c_str(), schedules.size());
 
       for (JsonObject sched : schedules) {
         int dayOfWeek = sched["dayOfWeek"] | 0;
@@ -778,20 +871,50 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     }
 
     if (localStorage && sdMounted) {
+      Serial.println("💾 Saving updated schedules to SD card...");
       saveScheduleToSD();
+      Serial.println("✅ Schedules saved to SD");
+    } else {
+      Serial.println("⚠️ SD not mounted or localStorage disabled, not saving to SD");
     }
 
-    publishMqttResponse(true, "Bulk sync completed");
+    // 🔥 STEP 2: FIRST RESPONSE - with commandId (critical for tracking)
+    DynamicJsonDocument response(256);
+    response["success"] = true;
+    response["message"] = "Bulk sync completed";
+    response["timestamp"] = getLocalTime().unixtime();
 
-    DynamicJsonDocument data(64);
+    // 👇 IMPORTANT: commandId must be included in response
+    if (commandId.length() > 0) {
+      response["commandId"] = commandId;
+    }
+
+    String responsePayload;
+    serializeJson(response, responsePayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, responsePayload.c_str());
+    Serial.printf("[ScheduleSync] Sent response with commandId: %s\n",
+                  commandId.length() > 0 ? commandId.c_str() : "none");
+
+    // 🔥 STEP 3: SECOND RESPONSE - with stats (optional)
+    DynamicJsonDocument data(128);
     data["added"] = addedCount;
     data["updated"] = updatedCount;
+
+    // Optional: agar chaho to yahan bhi commandId bhej sakte ho
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;  // iski zaroorat nahi, but helpful ho sakta hai
+    }
+
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.printf("[ScheduleSync] Complete: %d added, %d updated\n", addedCount, updatedCount);
   }
 
   else if (command == "get_device_schedules") {
+    String commandId = doc["commandId"] | "";
+
     publishMqttResponse(true, "Schedules fetched");
 
     DynamicJsonDocument data(8192);
@@ -809,13 +932,30 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       user["checkOutTo"] = u.checkOutTo;
     }
 
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
   else if (command == "restart") {
-    publishMqttResponse(true, "Device restarting...");
+    // publishMqttResponse(true, "Device restarting...");
+
+    String commandId = doc["commandId"] | "";
+
+    DynamicJsonDocument data(64);
+    data["success"] = true;
+    data["message"] = "Device restarting...";
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+    String dataPayload;
+    serializeJson(data, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
     delay(1000);
     ESP.restart();
   }
@@ -1606,7 +1746,53 @@ bool saveAttendanceLogToSD(
   return true;
 }
 
+// void saveScheduleToSD() {
+//   Serial.println("💾 === SAVING SCHEDULES TO SD ===");
+//   Serial.printf("Current userSchedules size: %d\n", userSchedules.size());
+
+//   DynamicJsonDocument doc(4096);
+//   JsonArray users = doc.createNestedArray("users");
+
+//   for (auto& u : userSchedules) {
+//     JsonObject o = users.createNestedObject();
+//     o["id"] = u.userId;
+//     o["cardUuid"] = u.cardUuid;
+//     o["name"] = u.userName;
+//     o["dayOfWeek"] = u.dayOfWeek;
+//     o["checkInFrom"] = u.checkInFrom;
+//     o["checkInTo"] = u.checkInTo;
+//     o["checkOutFrom"] = u.checkOutFrom;
+//     o["checkOutTo"] = u.checkOutTo;
+//   }
+
+//   Serial.printf("  Saving: User %d (%s) Day %d\n", u.userId, u.userName.c_str(), u.dayOfWeek);
+// }
+
+// File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
+// if (!file) {
+//   Serial.println("❌ Failed to open schedule file for writing!");
+//   return;
+// }
+
+// serializeJson(doc, file);
+// file.close();
+// }
+
 void saveScheduleToSD() {
+  Serial.println("💾 === SAVING SCHEDULES TO SD ===");
+  Serial.printf("Current userSchedules size: %d\n", userSchedules.size());
+
+  // Pehle purani file delete karo (ensure clean write)
+  if (SD.exists(SCHEDULE_FILE)) {
+    Serial.println("🗑️ Removing old schedule file...");
+    if (!SD.remove(SCHEDULE_FILE)) {
+      Serial.println("⚠️ Failed to remove old file, but continuing...");
+    } else {
+      Serial.println("✅ Old file removed");
+    }
+    delay(100);  // Give SD card time to process
+  }
+
   DynamicJsonDocument doc(4096);
   JsonArray users = doc.createNestedArray("users");
 
@@ -1620,23 +1806,151 @@ void saveScheduleToSD() {
     o["checkInTo"] = u.checkInTo;
     o["checkOutFrom"] = u.checkOutFrom;
     o["checkOutTo"] = u.checkOutTo;
+
+    Serial.printf("  Saving: User %d (%s) Day %d\n", u.userId, u.userName.c_str(), u.dayOfWeek);
   }
 
+  // Open file with FILE_WRITE mode (creates new file)
   File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
-  if (!file) return;
+  if (!file) {
+    Serial.println("❌ Failed to open schedule file for writing!");
+    return;
+  }
 
-  serializeJson(doc, file);
+  size_t bytesWritten = serializeJson(doc, file);
+  Serial.printf("✅ Written %d bytes\n", bytesWritten);
+
+  // 🔥 CRITICAL: Force flush and close properly
+  file.flush();
   file.close();
+  delay(100);  // Give SD card time to settle
+
+  Serial.println("✅ File closed successfully");
+
+  // 🔥 FIXED: Verify file with new file handle
+  File verifyFile = SD.open(SCHEDULE_FILE, FILE_READ);
+  if (verifyFile) {
+    Serial.printf("📁 Verification successful - file size: %d bytes\n", verifyFile.size());
+
+    // Quick content check - read first few bytes
+    char buffer[50];
+    int bytesRead = verifyFile.readBytes(buffer, 49);
+    buffer[bytesRead] = '\0';
+    Serial.printf("📄 File starts with: %s\n", buffer);
+
+    verifyFile.close();
+  } else {
+    Serial.println("❌ VERIFICATION FAILED - File cannot be opened after write!");
+
+    // 🔥 Try one more time with different approach
+    Serial.println("🔄 Attempting recovery write...");
+
+    File retryFile = SD.open(SCHEDULE_FILE, FILE_WRITE);
+    if (retryFile) {
+      bytesWritten = serializeJson(doc, retryFile);
+      retryFile.flush();
+      retryFile.close();
+      delay(100);
+
+      File checkAgain = SD.open(SCHEDULE_FILE, FILE_READ);
+      if (checkAgain) {
+        Serial.printf("✅ Recovery successful! File size: %d bytes\n", checkAgain.size());
+        checkAgain.close();
+      } else {
+        Serial.println("❌ RECOVERY FAILED - SD card may have issues");
+      }
+    }
+  }
+
+  Serial.println("💾 === SAVE COMPLETE ===\n");
 }
 
+// bool loadScheduleFromSD() {
+
+//   Serial.println("📂 === LOADING SCHEDULES FROM SD ===");
+
+//   if (!SD.exists(SCHEDULE_FILE)) {
+//     Serial.println("⚠️ No schedule file found on SD");
+//     return false;
+//   }
+
+//   File file = SD.open(SCHEDULE_FILE);
+//   if (!file) {
+//     Serial.println("❌ Failed to open schedule file for reading!");
+//     return false;
+//   }
+
+//   Serial.printf("📁 File size: %d bytes\n", file.size());
+
+//   DynamicJsonDocument doc(4096);
+//   DeserializationError error = deserializeJson(doc, file);
+//   if (error) {
+//     Serial.printf("❌ JSON parse error: %s\n", error.c_str());
+//     file.close();
+//     return false;
+//   }
+//   file.close();
+
+//   userSchedules.clear();
+
+//   JsonArray usersArray = doc["users"].as<JsonArray>();
+//   Serial.printf("Found %d users in schedule file\n", usersArray.size());
+
+//   for (JsonObject u : usersArray) {
+//     UserSchedule s;
+//     s.userId = u["id"];
+//     s.cardUuid = u["cardUuid"].as<String>();
+//     s.userName = u["name"].as<String>();
+//     s.dayOfWeek = u["dayOfWeek"];
+//     s.checkInFrom = u["checkInFrom"].as<String>();
+//     s.checkInTo = u["checkInTo"].as<String>();
+//     s.checkOutFrom = u["checkOutFrom"].as<String>();
+//     s.checkOutTo = u["checkOutTo"].as<String>();
+
+//     userSchedules.push_back(s);
+
+//     Serial.printf("  Loaded: User %d (%s) Day %d, Card: %s\n",
+//                   s.userId, s.userName.c_str(), s.dayOfWeek, s.cardUuid.c_str());
+//   }
+
+//   Serial.println("✅ Loaded schedules from SD: " + String(userSchedules.size()));
+//   Serial.println("📂 === LOAD COMPLETE ===\n");
+
+//   return true;
+// }
+
 bool loadScheduleFromSD() {
-  if (!SD.exists(SCHEDULE_FILE)) return false;
+  Serial.println("📂 === LOADING SCHEDULES FROM SD ===");
 
-  File file = SD.open(SCHEDULE_FILE);
-  if (!file) return false;
+  if (!SD.exists(SCHEDULE_FILE)) {
+    Serial.println("⚠️ No schedule file found on SD");
+    return false;
+  }
 
-  DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, file)) {
+  // Get file size first
+  File checkFile = SD.open(SCHEDULE_FILE, FILE_READ);
+  if (checkFile) {
+    Serial.printf("📁 File size: %d bytes\n", checkFile.size());
+    checkFile.close();
+  }
+
+  File file = SD.open(SCHEDULE_FILE, FILE_READ);
+  if (!file) {
+    Serial.println("❌ Failed to open schedule file for reading!");
+    return false;
+  }
+
+  // Check if file is empty
+  if (file.size() == 0) {
+    Serial.println("❌ Schedule file is empty!");
+    file.close();
+    return false;
+  }
+
+  DynamicJsonDocument doc(8192);  // Increased buffer size
+  DeserializationError error = deserializeJson(doc, file);
+  if (error) {
+    Serial.printf("❌ JSON parse error: %s\n", error.c_str());
     file.close();
     return false;
   }
@@ -1644,20 +1958,28 @@ bool loadScheduleFromSD() {
 
   userSchedules.clear();
 
-  for (JsonObject u : doc["users"].as<JsonArray>()) {
+  JsonArray usersArray = doc["users"].as<JsonArray>();
+  Serial.printf("Found %d users in schedule file\n", usersArray.size());
+
+  for (JsonObject u : usersArray) {
     UserSchedule s;
-    s.userId = u["id"];
+    s.userId = u["id"] | 0;
     s.cardUuid = u["cardUuid"].as<String>();
     s.userName = u["name"].as<String>();
-    s.dayOfWeek = u["dayOfWeek"];
+    s.dayOfWeek = u["dayOfWeek"] | 0;
     s.checkInFrom = u["checkInFrom"].as<String>();
     s.checkInTo = u["checkInTo"].as<String>();
     s.checkOutFrom = u["checkOutFrom"].as<String>();
     s.checkOutTo = u["checkOutTo"].as<String>();
+
     userSchedules.push_back(s);
+
+    Serial.printf("  Loaded: User %d (%s) Day %d, Card: %s\n",
+                  s.userId, s.userName.c_str(), s.dayOfWeek, s.cardUuid.c_str());
   }
 
-  Serial.println("✅ Loaded schedules from SD: " + String(userSchedules.size()));
+  Serial.printf("✅ Loaded schedules from SD: %d\n", userSchedules.size());
+  Serial.println("📂 === LOAD COMPLETE ===\n");
 
   return true;
 }
