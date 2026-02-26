@@ -50,14 +50,14 @@ PCF8574 pcf(PCF_ADDRESS);
 #define SS_PIN D4
 
 // ================== TESTING CONFIG ==================
-#define USE_NTP_TIME true
+#define USE_NTP_TIME false
 
 // ================== MANUAL TIME FOR TESTING ==================
 int manualYear = 2026;
 int manualMonth = 2;
-int manualDay = 10;
-int manualHour = 2;
-int manualMinute = 10;
+int manualDay = 23;
+int manualHour = 18;
+int manualMinute = 59;
 int manualSecond = 0;
 
 // ================== ATTENDANCE LOGIC HEADER ==================
@@ -246,14 +246,14 @@ DateTime getLocalTime() {
   DateTime local = DateTime(localUnix);
 
   //   // Debug output
-  // Serial.printf("🌍 UTC:  %04d-%02d-%02d %02d:%02d:%02d\n",
-  //               utc.year(), utc.month(), utc.day(),
-  //               utc.hour(), utc.minute(), utc.second());
+  Serial.printf("🌍 UTC:  %04d-%02d-%02d %02d:%02d:%02d\n",
+                utc.year(), utc.month(), utc.day(),
+                utc.hour(), utc.minute(), utc.second());
 
-  // Serial.printf("📍 Local: %04d-%02d-%02d %02d:%02d:%02d (Offset: %d min)\n",
-  //               local.year(), local.month(), local.day(),
-  //               local.hour(), local.minute(), local.second(),
-  //               timezoneOffsetMinutes);
+  Serial.printf("📍 Local: %04d-%02d-%02d %02d:%02d:%02d (Offset: %d min)\n",
+                local.year(), local.month(), local.day(),
+                local.hour(), local.minute(), local.second(),
+                timezoneOffsetMinutes);
 
   return local;
 }
@@ -1370,17 +1370,32 @@ int timeToSeconds(const String& timeStr) {
   }
 
   String cleanTime = timeStr;
+
+  // Remove AM/PM if present
+  cleanTime.replace(" AM", "");
+  cleanTime.replace(" PM", "");
+
   int dotIndex = cleanTime.indexOf('.');
   if (dotIndex > 0) {
     cleanTime = cleanTime.substring(0, dotIndex);
   }
 
+  // Parse time - handle both "HH:MM:SS" and "HH:MM" formats
   int h1 = cleanTime.substring(0, 2).toInt();
   int h2 = cleanTime.substring(3, 5).toInt();
   int sec = 0;
 
   if (cleanTime.length() >= 8) {
     sec = cleanTime.substring(6, 8).toInt();
+  }
+
+  // Handle PM conversion
+  if (timeStr.indexOf("PM") > 0 && h1 != 12) {
+    h1 += 12;
+  }
+  // Handle 12 AM case
+  if (timeStr.indexOf("AM") > 0 && h1 == 12) {
+    h1 = 0;
   }
 
   return h1 * 3600 + h2 * 60 + sec;
@@ -1576,16 +1591,19 @@ AttendanceResult processLocalAttendance(
     }
   }
 
+  // === FIXED LOGIC ORDER - EXACTLY LIKE YOUR WORKING COMMENTED CODE ===
+
+  // CASE 1: USER HASN'T CHECKED IN TODAY
   if (todaysCheckIns.size() == 0) {
     if (isBeforeCheckInWindow) {
       String checkInTime = addMinutesToTimeStr(todaySchedule.checkInFrom, -GRACE_EARLY_IN);
-      result.message = "Check-in opens at " + checkInTime;
+      result.message = "Shift hasn't started yet. Check-in window opens at " + checkInTime;
       return result;
     }
 
     if (isAfterCheckInWindow) {
       String closedTime = addMinutesToTimeStr(todaySchedule.checkInTo, GRACE_LATE_IN);
-      result.message = "Check-in window closed at " + closedTime;
+      result.message = "Check-in window closed at " + closedTime + ". Please wait for next shift.";
       return result;
     }
 
@@ -1608,30 +1626,7 @@ AttendanceResult processLocalAttendance(
     }
   }
 
-  else if (isAfterCheckOutWindow) {
-    if (todaysCheckIns.size() > 0 && todaysCheckOuts.size() == 0) {
-      String checkInTime = formatTimeDisplay(todaySchedule.checkInFrom);
-      String lateCheckOutEnd = addMinutesToTimeStr(todaySchedule.checkOutTo, GRACE_LATE_OUT);
-      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
-
-      result.message = "⚠️ Shift ended without check-out!\n   Check-in: " + checkInTime + "\n   Window closed: " + lateCheckOutEnd + "\n   Next: " + nextSchedule;
-      result.recordType = "in";
-      return result;
-    } else if (todaysCheckIns.size() == 0) {
-      String checkInStartTime = formatTimeDisplay(todaySchedule.checkInFrom);
-      String lateCheckInEnd = addMinutesToTimeStr(todaySchedule.checkInTo, GRACE_LATE_IN);
-      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
-
-      result.message = "❌ Missed shift!\n   Window: " + checkInStartTime + " - " + lateCheckInEnd + "\n   Next: " + nextSchedule;
-      result.recordType = "in";
-      return result;
-    } else {
-      result.message = "✅ Today's shift completed.";
-      result.recordType = "out";
-      return result;
-    }
-  }
-
+  // CASE 2: WE'RE IN CHECK-OUT WINDOW - CHECK THIS BEFORE CHECKING IF WINDOW IS CLOSED
   else if (isCheckOutWindow) {
     result.recordType = "out";
     result.success = true;
@@ -1662,12 +1657,42 @@ AttendanceResult processLocalAttendance(
     addRecord("out", currentTime, userId, cardUuid, userName);
   }
 
+  // CASE 3: CHECK-OUT WINDOW IS CLOSED - HANDLE MISSED CHECK-OUTS
+  else if (isAfterCheckOutWindow) {
+    if (todaysCheckIns.size() > 0 && todaysCheckOuts.size() == 0) {
+      // User checked in but didn't check out
+      String checkInTime = formatTimeDisplay(todaySchedule.checkInFrom);
+      String lateCheckOutEnd = addMinutesToTimeStr(todaySchedule.checkOutTo, GRACE_LATE_OUT);
+      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
+
+      result.message = "⚠️ Today's shift ended without check-out!\n   ✓ Check-in: " + checkInTime + "\n   ⛔ Check-out window closed: " + lateCheckOutEnd + "\n   📅 Next shift: " + nextSchedule;
+      result.recordType = "in";
+      return result;
+    } else if (todaysCheckIns.size() == 0) {
+      // User never checked in
+      String checkInStartTime = formatTimeDisplay(todaySchedule.checkInFrom);
+      String lateCheckInEnd = addMinutesToTimeStr(todaySchedule.checkInTo, GRACE_LATE_IN);
+      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
+
+      result.message = "❌ You missed today's shift!\n   ✓ Check-in window was: " + checkInStartTime + " - " + lateCheckInEnd + "\n   📅 Next shift: " + nextSchedule;
+      result.recordType = "in";
+      return result;
+    } else {
+      // User already checked out
+      result.message = "✅ Today's shift completed.";
+      result.recordType = "out";
+      return result;
+    }
+  }
+
+  // CASE 4: CHECK-OUT WINDOW NOT OPEN YET BUT USER IS CHECKED IN
   else if (hasOpenCheckIn && isBeforeCheckOutWindow) {
     String checkOutTime = formatTimeDisplay(todaySchedule.checkOutFrom);
     result.message = "Already checked in. Check-out opens at " + checkOutTime;
     return result;
   }
 
+  // DEFAULT CASE
   else {
     result.message = "Unable to process attendance at this time";
     return result;
@@ -1712,6 +1737,9 @@ bool saveAttendanceLogToSD(
     return false;
   }
 
+  Serial.print("Writing attendance to: ");
+  Serial.println(filename);
+
   if (fileExists) {
     if (!file.seek(file.size())) {
       file.close();
@@ -1746,51 +1774,23 @@ bool saveAttendanceLogToSD(
   return true;
 }
 
-// void saveScheduleToSD() {
-//   Serial.println("💾 === SAVING SCHEDULES TO SD ===");
-//   Serial.printf("Current userSchedules size: %d\n", userSchedules.size());
-
-//   DynamicJsonDocument doc(4096);
-//   JsonArray users = doc.createNestedArray("users");
-
-//   for (auto& u : userSchedules) {
-//     JsonObject o = users.createNestedObject();
-//     o["id"] = u.userId;
-//     o["cardUuid"] = u.cardUuid;
-//     o["name"] = u.userName;
-//     o["dayOfWeek"] = u.dayOfWeek;
-//     o["checkInFrom"] = u.checkInFrom;
-//     o["checkInTo"] = u.checkInTo;
-//     o["checkOutFrom"] = u.checkOutFrom;
-//     o["checkOutTo"] = u.checkOutTo;
-//   }
-
-//   Serial.printf("  Saving: User %d (%s) Day %d\n", u.userId, u.userName.c_str(), u.dayOfWeek);
-// }
-
-// File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
-// if (!file) {
-//   Serial.println("❌ Failed to open schedule file for writing!");
-//   return;
-// }
-
-// serializeJson(doc, file);
-// file.close();
-// }
-
 void saveScheduleToSD() {
-  Serial.println("💾 === SAVING SCHEDULES TO SD ===");
-  Serial.printf("Current userSchedules size: %d\n", userSchedules.size());
 
-  // Pehle purani file delete karo (ensure clean write)
   if (SD.exists(SCHEDULE_FILE)) {
-    Serial.println("🗑️ Removing old schedule file...");
     if (!SD.remove(SCHEDULE_FILE)) {
-      Serial.println("⚠️ Failed to remove old file, but continuing...");
-    } else {
-      Serial.println("✅ Old file removed");
+      Serial.println("❌ Cannot remove old schedule file!");
+      return;
     }
-    delay(100);  // Give SD card time to process
+  }
+
+  File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
+  if (file) {
+    file.seek(0);
+    file.truncate(0);
+  }
+  if (!file) {
+    Serial.println("❌ Open failed");
+    return;
   }
 
   DynamicJsonDocument doc(4096);
@@ -1806,118 +1806,16 @@ void saveScheduleToSD() {
     o["checkInTo"] = u.checkInTo;
     o["checkOutFrom"] = u.checkOutFrom;
     o["checkOutTo"] = u.checkOutTo;
-
-    Serial.printf("  Saving: User %d (%s) Day %d\n", u.userId, u.userName.c_str(), u.dayOfWeek);
   }
 
-  // Open file with FILE_WRITE mode (creates new file)
-  File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
-  if (!file) {
-    Serial.println("❌ Failed to open schedule file for writing!");
-    return;
-  }
-
-  size_t bytesWritten = serializeJson(doc, file);
-  Serial.printf("✅ Written %d bytes\n", bytesWritten);
-
-  // 🔥 CRITICAL: Force flush and close properly
+  String output;
+  serializeJson(doc, output);
+  file.print(output);
   file.flush();
   file.close();
-  delay(100);  // Give SD card time to settle
 
-  Serial.println("✅ File closed successfully");
-
-  // 🔥 FIXED: Verify file with new file handle
-  File verifyFile = SD.open(SCHEDULE_FILE, FILE_READ);
-  if (verifyFile) {
-    Serial.printf("📁 Verification successful - file size: %d bytes\n", verifyFile.size());
-
-    // Quick content check - read first few bytes
-    char buffer[50];
-    int bytesRead = verifyFile.readBytes(buffer, 49);
-    buffer[bytesRead] = '\0';
-    Serial.printf("📄 File starts with: %s\n", buffer);
-
-    verifyFile.close();
-  } else {
-    Serial.println("❌ VERIFICATION FAILED - File cannot be opened after write!");
-
-    // 🔥 Try one more time with different approach
-    Serial.println("🔄 Attempting recovery write...");
-
-    File retryFile = SD.open(SCHEDULE_FILE, FILE_WRITE);
-    if (retryFile) {
-      bytesWritten = serializeJson(doc, retryFile);
-      retryFile.flush();
-      retryFile.close();
-      delay(100);
-
-      File checkAgain = SD.open(SCHEDULE_FILE, FILE_READ);
-      if (checkAgain) {
-        Serial.printf("✅ Recovery successful! File size: %d bytes\n", checkAgain.size());
-        checkAgain.close();
-      } else {
-        Serial.println("❌ RECOVERY FAILED - SD card may have issues");
-      }
-    }
-  }
-
-  Serial.println("💾 === SAVE COMPLETE ===\n");
+  Serial.println("✅ Clean schedule saved");
 }
-
-// bool loadScheduleFromSD() {
-
-//   Serial.println("📂 === LOADING SCHEDULES FROM SD ===");
-
-//   if (!SD.exists(SCHEDULE_FILE)) {
-//     Serial.println("⚠️ No schedule file found on SD");
-//     return false;
-//   }
-
-//   File file = SD.open(SCHEDULE_FILE);
-//   if (!file) {
-//     Serial.println("❌ Failed to open schedule file for reading!");
-//     return false;
-//   }
-
-//   Serial.printf("📁 File size: %d bytes\n", file.size());
-
-//   DynamicJsonDocument doc(4096);
-//   DeserializationError error = deserializeJson(doc, file);
-//   if (error) {
-//     Serial.printf("❌ JSON parse error: %s\n", error.c_str());
-//     file.close();
-//     return false;
-//   }
-//   file.close();
-
-//   userSchedules.clear();
-
-//   JsonArray usersArray = doc["users"].as<JsonArray>();
-//   Serial.printf("Found %d users in schedule file\n", usersArray.size());
-
-//   for (JsonObject u : usersArray) {
-//     UserSchedule s;
-//     s.userId = u["id"];
-//     s.cardUuid = u["cardUuid"].as<String>();
-//     s.userName = u["name"].as<String>();
-//     s.dayOfWeek = u["dayOfWeek"];
-//     s.checkInFrom = u["checkInFrom"].as<String>();
-//     s.checkInTo = u["checkInTo"].as<String>();
-//     s.checkOutFrom = u["checkOutFrom"].as<String>();
-//     s.checkOutTo = u["checkOutTo"].as<String>();
-
-//     userSchedules.push_back(s);
-
-//     Serial.printf("  Loaded: User %d (%s) Day %d, Card: %s\n",
-//                   s.userId, s.userName.c_str(), s.dayOfWeek, s.cardUuid.c_str());
-//   }
-
-//   Serial.println("✅ Loaded schedules from SD: " + String(userSchedules.size()));
-//   Serial.println("📂 === LOAD COMPLETE ===\n");
-
-//   return true;
-// }
 
 bool loadScheduleFromSD() {
   Serial.println("📂 === LOADING SCHEDULES FROM SD ===");
@@ -1948,7 +1846,14 @@ bool loadScheduleFromSD() {
   }
 
   DynamicJsonDocument doc(8192);  // Increased buffer size
-  DeserializationError error = deserializeJson(doc, file);
+
+  String json = file.readString();
+  file.close();
+
+  Serial.println("RAW JSON:");
+  Serial.println(json);
+
+  DeserializationError error = deserializeJson(doc, json);
   if (error) {
     Serial.printf("❌ JSON parse error: %s\n", error.c_str());
     file.close();
