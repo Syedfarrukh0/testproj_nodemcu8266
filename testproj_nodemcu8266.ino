@@ -34,6 +34,8 @@ PCF8574 pcf(PCF_ADDRESS);
 #define EEPROM_AUTO_SYNC_ADDR 21
 #define EEPROM_TZ_ADDR 40
 #define EEPROM_OFFSET_ADDR 100
+#define EEPROM_SERVER_URL_ADDR 200
+#define EEPROM_SERVER_URL_LEN 100
 
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
@@ -56,8 +58,8 @@ PCF8574 pcf(PCF_ADDRESS);
 int manualYear = 2026;
 int manualMonth = 2;
 int manualDay = 23;
-int manualHour = 18;
-int manualMinute = 59;
+int manualHour = 2;
+int manualMinute = 10;
 int manualSecond = 0;
 
 // ================== ATTENDANCE LOGIC HEADER ==================
@@ -98,7 +100,8 @@ struct TodaysRecord {
 #define SCAN_INTERVAL 15000
 #define SCHEDULE_UPDATE_INTERVAL 86400000
 #define FAIL_LIMIT 5
-#define SERVER_URL "http://brayden-nonprovident-sizeably.ngrok-free.dev"
+#define DEFAULT_SERVER_URL "http://brayden-nonprovident-sizeably.ngrok-free.dev"
+String SERVER_URL = DEFAULT_SERVER_URL;
 
 const char* DEVICE_UUID = "9908bd1f-9571-4b49-baa4-36e4f27eab36";
 const char* DEVICE_SECRET = "ae756ac92c3e4d44361110b3ca4e7d9f";
@@ -236,6 +239,45 @@ bool findUserSchedule(int userId, int dayOfWeek, UserSchedule*& foundSchedule);
 void blinkWhiteLED();
 void blinkGreenOnce();
 void blinkRedTwice();
+
+// ================== SERVER URL FUNCTIONS ==================
+void loadServerUrlFromEEPROM() {
+  char url[EEPROM_SERVER_URL_LEN + 1] = { 0 };
+  for (int i = 0; i < EEPROM_SERVER_URL_LEN; i++) {
+    char c = EEPROM.read(EEPROM_SERVER_URL_ADDR + i);
+    if (c == '\0' || c == 0xFF) break;
+    url[i] = c;
+  }
+  url[EEPROM_SERVER_URL_LEN] = '\0';
+
+  String loadedUrl = String(url);
+  if (loadedUrl.length() > 0 && loadedUrl.startsWith("http")) {
+    SERVER_URL = loadedUrl;
+    Serial.println("📡 Server URL loaded from EEPROM: " + SERVER_URL);
+  } else {
+    SERVER_URL = DEFAULT_SERVER_URL;
+    Serial.println("📡 Using default server URL: " + SERVER_URL);
+  }
+}
+
+void saveServerUrlToEEPROM(String url) {
+  // Pehle purani URL clear karo
+  for (int i = 0; i < EEPROM_SERVER_URL_LEN; i++) {
+    EEPROM.write(EEPROM_SERVER_URL_ADDR + i, 0);
+  }
+
+  // Naya URL save karo
+  int len = url.length();
+  if (len > EEPROM_SERVER_URL_LEN) len = EEPROM_SERVER_URL_LEN;
+
+  for (int i = 0; i < len; i++) {
+    EEPROM.write(EEPROM_SERVER_URL_ADDR + i, url[i]);
+  }
+  EEPROM.write(EEPROM_SERVER_URL_ADDR + len, '\0');  // Null terminator
+  EEPROM.commit();
+
+  Serial.println("💾 Server URL saved to EEPROM: " + url);
+}
 
 // ================== LOCAL TIME HELPER ==================
 DateTime getLocalTime() {
@@ -424,6 +466,61 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
+  else if (command == "set_server_url") {
+    String commandId = doc["commandId"] | "";
+    String newUrl = doc["SERVER_URL"] | "";
+
+    if (newUrl.length() == 0) {
+      publishMqttResponse(false, "serverUrl is required", commandId);
+      return;
+    }
+
+    // Validate URL (basic check)
+    if (!newUrl.startsWith("http")) {
+      publishMqttResponse(false, "Invalid URL format. Must start with http:// or https://", commandId);
+      return;
+    }
+
+    // Save to EEPROM
+    saveServerUrlToEEPROM(newUrl);
+    SERVER_URL = newUrl;
+
+    // Success response
+    DynamicJsonDocument data(128);
+    data["success"] = true;
+    data["message"] = "Server URL updated successfully";
+    data["SERVER_URL"] = SERVER_URL;
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
+    String dataPayload;
+    serializeJson(data, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.println("🌐 Server URL changed to: " + SERVER_URL);
+
+    // Optional: Restart device to apply new URL everywhere
+    // delay(1000);
+    // ESP.restart();
+  }
+
+  else if (command == "get_server_url") {
+    String commandId = doc["commandId"] | "";
+
+    DynamicJsonDocument data(128);
+    data["success"] = true;
+    data["SERVER_URL"] = SERVER_URL;
+    data["defaultUrl"] = DEFAULT_SERVER_URL;
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
+    String dataPayload;
+    serializeJson(data, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+  }
+
   else if (command == "scan_wifi") {
     String commandId = doc["commandId"] | "";
 
@@ -471,6 +568,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     if (connected) {
       publishMqttStatus("wifi_connected", "Connected to " + ssid);
+    } else {
+      ESP.restart();
     }
   }
 
@@ -1126,21 +1225,7 @@ void checkReprovision() {
     wifiFailCount = 0;
     WiFi.disconnect(true);
     delay(500);
-
-    wifiManager.setConfigPortalTimeout(180);
-    wifiManager.setConnectTimeout(20);
-    wifiManager.setAPStaticIPConfig(
-      IPAddress(192, 168, 4, 1),
-      IPAddress(192, 168, 4, 1),
-      IPAddress(255, 255, 255, 0));
-
-    if (!wifiManager.startConfigPortal("RFID_Device_001", "12345678")) {
-      Serial.println("Portal timeout, restarting...");
-      delay(3000);
-      ESP.restart();
-    }
-
-    reprovisionMode = false;
+    wifiManager.startConfigPortal("RFID_Device_001", "12345678");
   }
 }
 
@@ -2795,8 +2880,9 @@ void setup() {
   Serial.println("\n\n=== ESP8266 Attendance Device Starting (MQTT Version) ===");
 
   EEPROM.begin(512);
-  uint8_t storedLS = EEPROM.read(EEPROM_LOCAL_STORAGE_ADDR);
+  loadServerUrlFromEEPROM();
 
+  uint8_t storedLS = EEPROM.read(EEPROM_LOCAL_STORAGE_ADDR);
   if (storedLS == 0 || storedLS == 1) {
     localStorage = storedLS;
   } else {
@@ -2886,13 +2972,20 @@ void setup() {
   mqttClient.setBufferSize(2048);
 
   Serial.println("Attempting WiFi connection...");
-
-  int wifiTimeout = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 40) {
-    delay(500);
-    Serial.print(".");
-    wifiTimeout++;
+  WiFi.mode(WIFI_STA);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setConnectTimeout(20);
+  bool res = wifiManager.autoConnect("RFID_Device_001", "12345678");
+  if (!res) {
+    Serial.println("Initial WiFi connection failed");
   }
+
+  // int wifiTimeout = 0;
+  // while (WiFi.status() != WL_CONNECTED && wifiTimeout < 40) {
+  //   delay(500);
+  //   Serial.print(".");
+  //   wifiTimeout++;
+  // }
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi Connected!");
@@ -2932,6 +3025,7 @@ void setup() {
 
 // ================== LOOP ==================
 void loop() {
+  wifiManager.process();
   static bool rtcSynced = false;
   unsigned long currentMillis = millis();
 
@@ -3011,7 +3105,11 @@ void loop() {
       wifiFailCount++;
       Serial.printf("WiFi disconnected. Attempt %d to reconnect...\n", wifiFailCount);
 
-      WiFi.reconnect();
+      // WiFi.reconnect();
+      if (WiFi.status() != WL_CONNECTED && !reprovisionMode) {
+        Serial.println("WiFi lost, trying to reconnect...");
+        WiFi.begin();
+      }
 
       if (wifiFailCount >= FAIL_LIMIT) {
         checkReprovision();
