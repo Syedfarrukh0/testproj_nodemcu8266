@@ -340,6 +340,11 @@ void publishMqttStatus(String status, String message) {
   doc["message"] = message;
   doc["timestamp"] = getLocalTime().unixtime();
   doc["ip"] = WiFi.localIP().toString();
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["ssid"] = WiFi.SSID();
+  } else {
+    doc["ssid"] = "";  // Empty string bhejo
+  }
   doc["rssi"] = WiFi.RSSI();
   doc["localStorage"] = localStorage;
   doc["sdMounted"] = sdMounted;
@@ -372,6 +377,42 @@ void publishHeartbeat() {
   doc["deviceUuid"] = DEVICE_UUID;
   doc["status"] = "connected";
   doc["ip"] = WiFi.localIP().toString();
+  if (WiFi.status() == WL_CONNECTED) {
+
+    int rssi = WiFi.RSSI();
+    doc["ssid"] = WiFi.SSID();
+    doc["rssi"] = rssi;
+
+    String quality;
+    int speed = 0;
+
+    if (rssi >= -50) {
+      quality = "Excellent";
+      speed = 72;  // theoretical max for strong signal
+    } else if (rssi >= -60) {
+      quality = "Good";
+      speed = 54;
+    } else if (rssi >= -70) {
+      quality = "Fair";
+      speed = 24;
+    } else if (rssi >= -80) {
+      quality = "Weak";
+      speed = 11;
+    } else {
+      quality = "Poor";
+      speed = 1;
+    }
+
+    doc["signal_quality"] = quality;
+    doc["wifi_speed_mbps"] = speed;
+
+  } else {
+    doc["ssid"] = WiFi.SSID();
+    doc["rssi"] = -100;
+    doc["signal_quality"] = "Disconnected";
+    doc["wifi_speed_mbps"] = 0;
+  }
+
   doc["schedulesLoaded"] = userSchedules.size();
   doc["autoSyncEnabled"] = autoSyncEnabled;
   doc["timestamp"] = getLocalTime().unixtime();
