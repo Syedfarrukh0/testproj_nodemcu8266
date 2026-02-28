@@ -377,6 +377,10 @@ void publishHeartbeat() {
   doc["deviceUuid"] = DEVICE_UUID;
   doc["status"] = "connected";
   doc["ip"] = WiFi.localIP().toString();
+
+  doc["timezone"] = deviceTimezone;
+  doc["timezoneOffset"] = timezoneOffsetMinutes;
+
   if (WiFi.status() == WL_CONNECTED) {
 
     int rssi = WiFi.RSSI();
@@ -3146,7 +3150,7 @@ void loop() {
       wifiFailCount++;
       Serial.printf("WiFi disconnected. Attempt %d to reconnect...\n", wifiFailCount);
 
-      // WiFi.reconnect();
+      WiFi.reconnect();
       if (WiFi.status() != WL_CONNECTED && !reprovisionMode) {
         Serial.println("WiFi lost, trying to reconnect...");
         WiFi.begin();
