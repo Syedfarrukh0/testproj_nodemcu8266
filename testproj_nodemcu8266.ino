@@ -545,9 +545,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     Serial.println("🌐 Server URL changed to: " + SERVER_URL);
 
-    // Optional: Restart device to apply new URL everywhere
-    // delay(1000);
-    // ESP.restart();
+    delay(1000);
+    ESP.restart();
   }
 
   else if (command == "get_server_url") {
@@ -601,19 +600,69 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     String password = doc["password"] | "";
 
     if (ssid.length() == 0) {
-      publishMqttResponse(false, "SSID missing");
+      publishMqttResponse(false, "SSID missing", commandId);
       return;
     }
 
-    publishMqttResponse(true, "WiFi credentials received. Connecting...");
+    publishMqttResponse(true, "WiFi credentials received. Connecting...", commandId);
 
     delay(500);
 
     bool connected = connectToWifi(ssid, password);
 
     if (connected) {
+
+      if (!mqttClient.connected()) {
+        Serial.println("⚠️ MQTT disconnected, reconnecting...");
+        connectToMqtt();
+        delay(500);
+      }
+
+      DynamicJsonDocument responseData(256);
+      responseData["success"] = true;
+      responseData["message"] = "Successfully connected to WiFi";
+      responseData["ssid"] = ssid;
+      responseData["ip"] = WiFi.localIP().toString();
+      responseData["mac"] = WiFi.macAddress();
+      responseData["timestamp"] = getLocalTime().unixtime();
+
+      if (commandId.length() > 0) {
+        responseData["commandId"] = commandId;  // IMPORTANT: commandId wapas bhejo
+      }
+
+      String payload;
+      serializeJson(responseData, payload);
+
+      bool published = false;
+      for (int retry = 0; retry < 3; retry++) {
+        if (mqttClient.connected()) {
+          published = mqttClient.publish(MQTT_TOPIC_RESPONSE, payload.c_str());
+          if (published) {
+            Serial.println("✅ Second response published successfully");
+            break;
+          }
+        }
+        Serial.println("⚠️ MQTT publish failed, retrying in 500ms...");
+        delay(500);
+        if (!mqttClient.connected()) {
+          connectToMqtt();
+        }
+      }
+
+      if (!published) {
+        Serial.println("❌ Failed to publish second response after 3 retries");
+        // Store in EEPROM to send later? Optional
+      }
+
       publishMqttStatus("wifi_connected", "Connected to " + ssid);
     } else {
+      int addr = 400;         // EEPROM address for failed command
+      EEPROM.write(addr, 1);  // Flag that failure exists
+      for (int i = 0; i < commandId.length() && i < 20; i++) {
+        EEPROM.write(addr + 1 + i, commandId[i]);
+      }
+      EEPROM.write(addr + 21, 0);  // Null terminator
+      EEPROM.commit();
       ESP.restart();
     }
   }
@@ -1245,6 +1294,10 @@ bool connectToWifi(String ssid, String password) {
     Serial.println(WiFi.localIP());
 
     blinkGreenOnce();
+
+    if (!mqttClient.connected()) {
+      connectToMqtt();
+    }
 
     if (localStorage) {
       fetchAndStoreSchedules();
@@ -2893,6 +2946,47 @@ String listAllLogFiles() {
   return response;
 }
 
+// check wifi failure stored msg
+void checkPendingWifiFailure() {
+  int addr = 400;
+  if (EEPROM.read(addr) == 1) {
+    Serial.println("📨 Found pending WiFi failure");
+
+    // Read stored commandId
+    char buf[21] = { 0 };
+    for (int i = 0; i < 20; i++) {
+      char c = EEPROM.read(addr + 1 + i);
+      if (c == 0) break;
+      buf[i] = c;
+    }
+    String commandId = String(buf);
+
+    // Clear from EEPROM
+    EEPROM.write(addr, 0);
+    for (int i = 0; i < 20; i++) {
+      EEPROM.write(addr + 1 + i, 0);
+    }
+    EEPROM.commit();
+
+    // Send failure response now that device is connected
+    DynamicJsonDocument data(128);
+    data["success"] = false;
+    data["message"] = "Failed connect to WiFi. Please check password";
+    data["ssid"] = "";  // SSID unknown now
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
+    }
+
+    String payload;
+    serializeJson(data, payload);
+
+    if (mqttClient.connected()) {
+      mqttClient.publish(MQTT_TOPIC_RESPONSE, payload.c_str());
+      Serial.println("✅ Pending failure response sent");
+    }
+  }
+}
+
 // ================== LED FUNCTIONS ==================
 void blinkWhiteLED() {
   if (millis() - lastLedToggle >= 300) {
@@ -3047,6 +3141,10 @@ void setup() {
     }
   } else {
     Serial.println("\nWiFi not connected, using offline mode");
+  }
+
+  if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+    checkPendingWifiFailure();
   }
 
   reprovisionMode = false;
