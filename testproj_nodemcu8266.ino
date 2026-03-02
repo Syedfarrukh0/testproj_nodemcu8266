@@ -568,7 +568,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   else if (command == "scan_wifi") {
     String commandId = doc["commandId"] | "";
 
-    publishMqttResponse(true, "WiFi scan completed");
+    // publishMqttResponse(true, "WiFi scan completed");
 
     int n = WiFi.scanNetworks();
 
@@ -687,9 +687,9 @@ void handleMqttCommand(String command, JsonDocument& doc) {
         userSchedules.clear();
       }
 
-      publishMqttResponse(true, "Local storage toggled");
-
-      DynamicJsonDocument data(64);
+      DynamicJsonDocument data(128);
+      data["success"] = true;
+      data["message"] = "Local storage toggled";
       data["localStorage"] = localStorage;
 
       if (commandId.length() > 0) {
@@ -703,9 +703,9 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       delay(1000);
       ESP.restart();
     } else {
-      publishMqttResponse(true, "Already set");
-
-      DynamicJsonDocument data(64);
+      DynamicJsonDocument data(128);
+      data["success"] = true;
+      data["message"] = "Already set";
       data["localStorage"] = localStorage;
 
       if (commandId.length() > 0) {
@@ -740,11 +740,12 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     EEPROM.put(EEPROM_OFFSET_ADDR, timezoneOffsetMinutes);
     EEPROM.commit();
 
-    publishMqttResponse(true, "Timezone updated");
-
-    DynamicJsonDocument data(64);
+    DynamicJsonDocument data(128);
+    data["success"] = true;
+    data["message"] = "Timezone updated successfully";
     data["timezone"] = deviceTimezone;
     data["offset"] = timezoneOffsetMinutes;
+    data["offsetStr"] = offsetStr;
 
     if (commandId.length() > 0) {
       data["commandId"] = commandId;
@@ -957,10 +958,11 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       EEPROM.commit();
     }
 
-    publishMqttResponse(true, "Auto sync toggled");
-
-    DynamicJsonDocument data(64);
+    DynamicJsonDocument data(128);
+    data["success"] = true;
+    data["message"] = "Auto sync toggled";
     data["autoSync"] = autoSyncEnabled;
+    data["enabled"] = autoSyncEnabled;
 
     if (commandId.length() > 0) {
       data["commandId"] = commandId;
@@ -984,21 +986,29 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     bool result = syncMonthlyRecordsToServer(year, month);
 
-    if (result) {
-      DynamicJsonDocument data(64);
-      data["message"] = "Sync completed successfully";
-      // 🔥 ADD commandId if present
-      if (commandId.length() > 0) {
-        data["commandId"] = commandId;
-      }
-      String dataPayload;
-      serializeJson(data, dataPayload);
-      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+    DynamicJsonDocument data(128);
+    data["command"] = "manual_sync";
 
-      // publishMqttResponse(true, "Sync completed successfully");
-    } else {
-      publishMqttResponse(false, "No records to sync or sync failed");
+    if (commandId.length() > 0) {
+      data["commandId"] = commandId;
     }
+
+    if (result) {
+      data["success"] = true;
+      data["message"] = "Sync completed successfully";
+      data["year"] = year;
+      data["month"] = month;
+    } else {
+      // publishMqttResponse(false, "No records to sync or sync failed", commandId);
+      data["success"] = false;
+      data["message"] = "No records to sync or sync failed";
+      data["year"] = year;
+      data["month"] = month;
+    }
+
+    String dataPayload;
+    serializeJson(data, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
   }
 
   else if (command == "sync_user_schedule") {
@@ -1072,10 +1082,13 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     }
 
     // 🔥 STEP 2: FIRST RESPONSE - with commandId (critical for tracking)
-    DynamicJsonDocument response(256);
+    DynamicJsonDocument response(512);
     response["success"] = true;
     response["message"] = "Bulk sync completed";
     response["timestamp"] = getLocalTime().unixtime();
+    response["added"] = addedCount;
+    response["updated"] = updatedCount;
+    response["totalUsers"] = userSchedules.size();
 
     // 👇 IMPORTANT: commandId must be included in response
     if (commandId.length() > 0) {
@@ -1089,26 +1102,26 @@ void handleMqttCommand(String command, JsonDocument& doc) {
                   commandId.length() > 0 ? commandId.c_str() : "none");
 
     // 🔥 STEP 3: SECOND RESPONSE - with stats (optional)
-    DynamicJsonDocument data(128);
-    data["added"] = addedCount;
-    data["updated"] = updatedCount;
+    // DynamicJsonDocument data(128);
+    // data["added"] = addedCount;
+    // data["updated"] = updatedCount;
 
-    // Optional: agar chaho to yahan bhi commandId bhej sakte ho
-    if (commandId.length() > 0) {
-      data["commandId"] = commandId;  // iski zaroorat nahi, but helpful ho sakta hai
-    }
+    // // Optional: agar chaho to yahan bhi commandId bhej sakte ho
+    // if (commandId.length() > 0) {
+    //   data["commandId"] = commandId;  // iski zaroorat nahi, but helpful ho sakta hai
+    // }
 
-    String dataPayload;
-    serializeJson(data, dataPayload);
-    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+    // String dataPayload;
+    // serializeJson(data, dataPayload);
+    // mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
 
-    Serial.printf("[ScheduleSync] Complete: %d added, %d updated\n", addedCount, updatedCount);
+    // Serial.printf("[ScheduleSync] Complete: %d added, %d updated\n", addedCount, updatedCount);
   }
 
   else if (command == "get_device_schedules") {
     String commandId = doc["commandId"] | "";
 
-    publishMqttResponse(true, "Schedules fetched");
+    publishMqttResponse(true, "Schedules fetched", commandId);
 
     DynamicJsonDocument data(8192);
     JsonArray users = data.createNestedArray("users");
