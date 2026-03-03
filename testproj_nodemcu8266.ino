@@ -769,25 +769,60 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     }
 
     DynamicJsonDocument respDoc(2048);
-    deserializeJson(respDoc, response);
+    DeserializationError error = deserializeJson(respDoc, response);
 
-    if (respDoc["success"]) {
-      publishMqttResponse(true, respDoc["message"].as<String>());
+    // 🔥 SINGLE RESPONSE
+    DynamicJsonDocument finalResponse(2048);
 
-      JsonVariant data = respDoc["data"];
-      DynamicJsonDocument dataDoc(1024);
-      dataDoc["data"] = data;
+    if (!error) {
+      finalResponse["success"] = respDoc["success"];
+      finalResponse["message"] = respDoc["message"].as<String>();
 
-      if (commandId.length() > 0) {
-        dataDoc["commandId"] = commandId;
+      // Add data if present
+      if (respDoc.containsKey("data")) {
+        finalResponse["data"] = respDoc["data"];
+        if (respDoc["data"].is<JsonArray>()) {
+          JsonArray dataArray = respDoc["data"].as<JsonArray>();
+          finalResponse["recordCount"] = dataArray.size();
+        }
       }
-
-      String dataPayload;
-      serializeJson(dataDoc, dataPayload);
-      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
     } else {
-      publishMqttResponse(false, respDoc["message"].as<String>());
+      finalResponse["success"] = false;
+      finalResponse["message"] = "Failed to parse records";
     }
+
+    // Add commandId
+    if (commandId.length() > 0) {
+      finalResponse["commandId"] = commandId;
+    }
+
+    String dataPayload;
+    serializeJson(finalResponse, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.printf("📤 Sent attendance records response for command: %s\n",
+                  commandId.c_str());
+
+    // DynamicJsonDocument respDoc(2048);
+    // deserializeJson(respDoc, response);
+
+    // if (respDoc["success"]) {
+    //   publishMqttResponse(true, respDoc["message"].as<String>());
+
+    //   JsonVariant data = respDoc["data"];
+    //   DynamicJsonDocument dataDoc(1024);
+    //   dataDoc["data"] = data;
+
+    //   if (commandId.length() > 0) {
+    //     dataDoc["commandId"] = commandId;
+    //   }
+
+    //   String dataPayload;
+    //   serializeJson(dataDoc, dataPayload);
+    //   mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+    // } else {
+    //   publishMqttResponse(false, respDoc["message"].as<String>());
+    // }
   }
 
   else if (command == "delete_attendance_records") {
@@ -869,25 +904,64 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     }
 
     DynamicJsonDocument respDoc(2048);
-    deserializeJson(respDoc, response);
+    DeserializationError error = deserializeJson(respDoc, response);
 
-    if (respDoc["success"]) {
-      publishMqttResponse(true, respDoc["message"].as<String>());
+    // 🔥 SINGLE RESPONSE
+    DynamicJsonDocument finalResponse(2048);
 
-      JsonVariant data = respDoc["data"];
-      DynamicJsonDocument dataDoc(1024);
-      dataDoc["data"] = data;
+    if (!error && respDoc["success"]) {
+      finalResponse["success"] = true;
+      finalResponse["message"] = respDoc["message"].as<String>();
+      finalResponse["year"] = year;
+      finalResponse["month"] = month;
 
-      if (commandId.length() > 0) {
-        dataDoc["commandId"] = commandId;
+      // Add data if present
+      if (respDoc.containsKey("data")) {
+        finalResponse["data"] = respDoc["data"];
+        if (respDoc["data"].is<JsonArray>()) {
+          JsonArray dataArray = respDoc["data"].as<JsonArray>();
+          finalResponse["recordCount"] = dataArray.size();
+        }
       }
-
-      String dataPayload;
-      serializeJson(dataDoc, dataPayload);
-      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
     } else {
-      publishMqttResponse(false, respDoc["message"].as<String>());
+      finalResponse["success"] = false;
+      finalResponse["message"] = respDoc["message"] | "Failed to fetch monthly records";
+      finalResponse["year"] = year;
+      finalResponse["month"] = month;
     }
+
+    // Add commandId
+    if (commandId.length() > 0) {
+      finalResponse["commandId"] = commandId;
+    }
+
+    String dataPayload;
+    serializeJson(finalResponse, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.printf("📤 Sent monthly records response for %d/%d with %d records\n",
+                  year, month, finalResponse["recordCount"] | 0);
+
+    // DynamicJsonDocument respDoc(2048);
+    // deserializeJson(respDoc, response);
+
+    // if (respDoc["success"]) {
+    //   publishMqttResponse(true, respDoc["message"].as<String>());
+
+    //   JsonVariant data = respDoc["data"];
+    //   DynamicJsonDocument dataDoc(1024);
+    //   dataDoc["data"] = data;
+
+    //   if (commandId.length() > 0) {
+    //     dataDoc["commandId"] = commandId;
+    //   }
+
+    //   String dataPayload;
+    //   serializeJson(dataDoc, dataPayload);
+    //   mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+    // } else {
+    //   publishMqttResponse(false, respDoc["message"].as<String>());
+    // }
   }
 
   else if (command == "delete_monthly_records") {
