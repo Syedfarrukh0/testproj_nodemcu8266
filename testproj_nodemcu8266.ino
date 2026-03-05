@@ -157,11 +157,11 @@ std::vector<TodaysRecord> todaysCheckOuts;
 int currentProcessingDay = -1;
 
 // ================== DAILY LOG FILE ==================
-const char* LOG_FILE = "/attendance_logs.csv";
+// const char* LOG_FILE = "/attendance_logs.csv";
 const char* DAILY_LOG_PREFIX = "/log_";
 
 // ================== MONTHLY LOG FILE ==================
-#define MONTHLY_LOG_PREFIX "/monthly_"
+// #define MONTHLY_LOG_PREFIX "/monthly_"
 
 // ================== STRUCTURES ==================
 struct UserSchedule {
