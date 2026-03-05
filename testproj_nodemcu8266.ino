@@ -40,6 +40,9 @@ PCF8574 pcf(PCF_ADDRESS);
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
 #define SCHEDULE_FILE "/schedule.json"
+#define SCHEDULES_FOLDER "/schedules/"
+#define ATTENDANCE_FOLDER "/attendance/"  // Root attendance folder
+#define MONTHLY_FOLDER_PREFIX "%04d_%02d/"
 
 // ================== LED PINS on PCF8574 ==================
 #define WHITE_LED_PIN 0
@@ -453,7 +456,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.println(message);
 
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DeserializationError error = deserializeJson(doc, message);
 
   if (error) {
@@ -568,8 +571,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   else if (command == "scan_wifi") {
     String commandId = doc["commandId"] | "";
 
-    // publishMqttResponse(true, "WiFi scan completed");
-
     int n = WiFi.scanNetworks();
 
     DynamicJsonDocument data(4096);
@@ -627,7 +628,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       responseData["timestamp"] = getLocalTime().unixtime();
 
       if (commandId.length() > 0) {
-        responseData["commandId"] = commandId;  // IMPORTANT: commandId wapas bhejo
+        responseData["commandId"] = commandId;
       }
 
       String payload;
@@ -651,7 +652,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
       if (!published) {
         Serial.println("❌ Failed to publish second response after 3 retries");
-        // Store in EEPROM to send later? Optional
       }
 
       publishMqttStatus("wifi_connected", "Connected to " + ssid);
@@ -771,7 +771,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     DynamicJsonDocument respDoc(2048);
     DeserializationError error = deserializeJson(respDoc, response);
 
-    // 🔥 SINGLE RESPONSE
+    // SINGLE RESPONSE
     DynamicJsonDocument finalResponse(2048);
 
     if (!error) {
@@ -802,27 +802,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     Serial.printf("📤 Sent attendance records response for command: %s\n",
                   commandId.c_str());
-
-    // DynamicJsonDocument respDoc(2048);
-    // deserializeJson(respDoc, response);
-
-    // if (respDoc["success"]) {
-    //   publishMqttResponse(true, respDoc["message"].as<String>());
-
-    //   JsonVariant data = respDoc["data"];
-    //   DynamicJsonDocument dataDoc(1024);
-    //   dataDoc["data"] = data;
-
-    //   if (commandId.length() > 0) {
-    //     dataDoc["commandId"] = commandId;
-    //   }
-
-    //   String dataPayload;
-    //   serializeJson(dataDoc, dataPayload);
-    //   mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
-    // } else {
-    //   publishMqttResponse(false, respDoc["message"].as<String>());
-    // }
   }
 
   else if (command == "delete_attendance_records") {
@@ -840,16 +819,18 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     deserializeJson(respDoc, response);
 
     if (respDoc["success"]) {
-      DynamicJsonDocument data(128);
+      DynamicJsonDocument data(256);
+      data["success"] = true;
       data["message"] = respDoc["message"];
+      data["deletedCount"] = respDoc["deletedCount"];
+      data["totalCount"] = respDoc["totalCount"];
+      data["cardUuid"] = cardUuid;
       if (commandId.length() > 0) {
         data["commandId"] = commandId;
       }
       String dataPayload;
       serializeJson(data, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
-
-      // publishMqttResponse(true, respDoc["message"].as<String>());
     } else {
       publishMqttResponse(false, respDoc["message"].as<String>());
     }
@@ -891,22 +872,28 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     String cardUuid = doc["cardUuid"] | "";
 
     if (year == 0 || month == 0) {
-      DateTime now = rtc.now();
+      DateTime now = getLocalTime();
       year = now.year();
       month = now.month();
     }
 
+    Serial.printf("DEBUG get_monthly_records: year=%d month=%d cardUuid=%s\n",
+                  year, month, cardUuid.c_str());
+
     String response;
     if (cardUuid.length() > 0) {
+      Serial.println("DEBUG: calling getUserMonthlyRecords");
       response = getUserMonthlyRecords(cardUuid, year, month);
     } else {
+      Serial.println("DEBUG: calling getMonthlyAttendanceRecords");
       response = getMonthlyAttendanceRecords(year, month);
     }
+
+    Serial.println("DEBUG raw response: " + response);  // ← YEH MOST IMPORTANT HAI
 
     DynamicJsonDocument respDoc(2048);
     DeserializationError error = deserializeJson(respDoc, response);
 
-    // 🔥 SINGLE RESPONSE
     DynamicJsonDocument finalResponse(2048);
 
     if (!error && respDoc["success"]) {
@@ -915,7 +902,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       finalResponse["year"] = year;
       finalResponse["month"] = month;
 
-      // Add data if present
       if (respDoc.containsKey("data")) {
         finalResponse["data"] = respDoc["data"];
         if (respDoc["data"].is<JsonArray>()) {
@@ -930,7 +916,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       finalResponse["month"] = month;
     }
 
-    // Add commandId
     if (commandId.length() > 0) {
       finalResponse["commandId"] = commandId;
     }
@@ -941,27 +926,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
     Serial.printf("📤 Sent monthly records response for %d/%d with %d records\n",
                   year, month, finalResponse["recordCount"] | 0);
-
-    // DynamicJsonDocument respDoc(2048);
-    // deserializeJson(respDoc, response);
-
-    // if (respDoc["success"]) {
-    //   publishMqttResponse(true, respDoc["message"].as<String>());
-
-    //   JsonVariant data = respDoc["data"];
-    //   DynamicJsonDocument dataDoc(1024);
-    //   dataDoc["data"] = data;
-
-    //   if (commandId.length() > 0) {
-    //     dataDoc["commandId"] = commandId;
-    //   }
-
-    //   String dataPayload;
-    //   serializeJson(dataDoc, dataPayload);
-    //   mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
-    // } else {
-    //   publishMqttResponse(false, respDoc["message"].as<String>());
-    // }
   }
 
   else if (command == "delete_monthly_records") {
@@ -1001,25 +965,56 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     String response = listAllLogFiles();
 
     DynamicJsonDocument respDoc(4096);
-    deserializeJson(respDoc, response);
+    DeserializationError error = deserializeJson(respDoc, response);
 
-    if (respDoc["success"]) {
-      publishMqttResponse(true, respDoc["message"].as<String>());
+    // SINGLE RESPONSE
+    DynamicJsonDocument finalResponse(4096);
 
-      JsonVariant data = respDoc["data"];
-      DynamicJsonDocument dataDoc(2048);
-      dataDoc["data"] = data;
+    if (!error && respDoc["success"]) {
+      finalResponse["success"] = true;
+      finalResponse["message"] = respDoc["message"].as<String>();
 
-      if (commandId.length() > 0) {
-        dataDoc["commandId"] = commandId;
+      // Add data if present
+      if (respDoc.containsKey("data")) {
+        finalResponse["data"] = respDoc["data"];
+
+        // Extract values first, then add
+        JsonObject data = respDoc["data"];
+
+        int dailyCount = 0;
+        int monthlyCount = 0;
+
+        if (data.containsKey("dailyFiles")) {
+          JsonArray dailyFiles = data["dailyFiles"];
+          dailyCount = dailyFiles.size();
+          finalResponse["dailyCount"] = dailyCount;
+        }
+
+        if (data.containsKey("monthlyFiles")) {
+          JsonArray monthlyFiles = data["monthlyFiles"];
+          monthlyCount = monthlyFiles.size();
+          finalResponse["monthlyCount"] = monthlyCount;
+        }
+
+        // Add total after extracting values
+        finalResponse["totalFiles"] = dailyCount + monthlyCount;
       }
-
-      String dataPayload;
-      serializeJson(dataDoc, dataPayload);
-      mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
     } else {
-      publishMqttResponse(false, respDoc["message"].as<String>());
+      finalResponse["success"] = false;
+      finalResponse["message"] = respDoc["message"] | "Failed to list files";
     }
+
+    // Add commandId
+    if (commandId.length() > 0) {
+      finalResponse["commandId"] = commandId;
+    }
+
+    String dataPayload;
+    serializeJson(finalResponse, dataPayload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.printf("📤 Sent file list response with %d files\n",
+                  finalResponse["totalFiles"] | 0);
   }
 
   else if (command == "toggle_auto_sync") {
@@ -1073,7 +1068,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       data["year"] = year;
       data["month"] = month;
     } else {
-      // publishMqttResponse(false, "No records to sync or sync failed", commandId);
       data["success"] = false;
       data["message"] = "No records to sync or sync failed";
       data["year"] = year;
@@ -1086,7 +1080,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "sync_user_schedule") {
-    // 🔥 STEP 1: Get commandId from incoming message
+    // Get commandId from incoming message
     String commandId = doc["commandId"] | "";
 
     bool replaceAll = doc["replaceAll"] | false;
@@ -1155,7 +1149,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       Serial.println("⚠️ SD not mounted or localStorage disabled, not saving to SD");
     }
 
-    // 🔥 STEP 2: FIRST RESPONSE - with commandId (critical for tracking)
+    // FIRST RESPONSE - with commandId (critical for tracking)
     DynamicJsonDocument response(512);
     response["success"] = true;
     response["message"] = "Bulk sync completed";
@@ -1164,7 +1158,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     response["updated"] = updatedCount;
     response["totalUsers"] = userSchedules.size();
 
-    // 👇 IMPORTANT: commandId must be included in response
+    // commandId must be included in response
     if (commandId.length() > 0) {
       response["commandId"] = commandId;
     }
@@ -1174,43 +1168,58 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     mqttClient.publish(MQTT_TOPIC_RESPONSE, responsePayload.c_str());
     Serial.printf("[ScheduleSync] Sent response with commandId: %s\n",
                   commandId.length() > 0 ? commandId.c_str() : "none");
-
-    // 🔥 STEP 3: SECOND RESPONSE - with stats (optional)
-    // DynamicJsonDocument data(128);
-    // data["added"] = addedCount;
-    // data["updated"] = updatedCount;
-
-    // // Optional: agar chaho to yahan bhi commandId bhej sakte ho
-    // if (commandId.length() > 0) {
-    //   data["commandId"] = commandId;  // iski zaroorat nahi, but helpful ho sakta hai
-    // }
-
-    // String dataPayload;
-    // serializeJson(data, dataPayload);
-    // mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
-
-    // Serial.printf("[ScheduleSync] Complete: %d added, %d updated\n", addedCount, updatedCount);
   }
 
   else if (command == "get_device_schedules") {
     String commandId = doc["commandId"] | "";
-
-    publishMqttResponse(true, "Schedules fetched", commandId);
+    String targetCardUuid = doc["cardUuid"] | "";
 
     DynamicJsonDocument data(8192);
+    data["success"] = true;
+    data["message"] = "Schedules fetched";
+
     JsonArray users = data.createNestedArray("users");
 
-    for (auto& u : userSchedules) {
-      JsonObject user = users.createNestedObject();
-      user["id"] = u.userId;
-      user["cardUuid"] = u.cardUuid;
-      user["name"] = u.userName;
-      user["dayOfWeek"] = u.dayOfWeek;
-      user["checkInFrom"] = u.checkInFrom;
-      user["checkInTo"] = u.checkInTo;
-      user["checkOutFrom"] = u.checkOutFrom;
-      user["checkOutTo"] = u.checkOutTo;
+    int totalCount = 0;
+
+    if (targetCardUuid.length() > 0) {
+      // Sirf specific cardUuid ke schedules bhejo
+      Serial.println("Returning schedules only for cardUuid: " + targetCardUuid);
+
+      for (auto& u : userSchedules) {
+        if (u.cardUuid == targetCardUuid) {
+          JsonObject user = users.createNestedObject();
+          user["id"] = u.userId;
+          user["cardUuid"] = u.cardUuid;
+          user["name"] = u.userName;
+          user["dayOfWeek"] = u.dayOfWeek;
+          user["checkInFrom"] = u.checkInFrom;
+          user["checkInTo"] = u.checkInTo;
+          user["checkOutFrom"] = u.checkOutFrom;
+          user["checkOutTo"] = u.checkOutTo;
+          totalCount++;
+        }
+      }
+    } else {
+      // Saare users ke schedules bhejo (default behavior)
+      Serial.println("Returning ALL loaded schedules");
+
+      for (auto& u : userSchedules) {
+        JsonObject user = users.createNestedObject();
+        user["id"] = u.userId;
+        user["cardUuid"] = u.cardUuid;
+        user["name"] = u.userName;
+        user["dayOfWeek"] = u.dayOfWeek;
+        user["checkInFrom"] = u.checkInFrom;
+        user["checkInTo"] = u.checkInTo;
+        user["checkOutFrom"] = u.checkOutFrom;
+        user["checkOutTo"] = u.checkOutTo;
+        totalCount++;
+      }
     }
+
+    data["totalUsers"] = totalCount;
+    data["filteredByCardUuid"] = (targetCardUuid.length() > 0) ? targetCardUuid : "all";
 
     if (commandId.length() > 0) {
       data["commandId"] = commandId;
@@ -1219,13 +1228,13 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
+
+    Serial.printf("Sent %d schedules in response (commandId: %s)\n",
+                  totalCount, commandId.c_str());
   }
 
   else if (command == "restart") {
-    // publishMqttResponse(true, "Device restarting...");
-
     String commandId = doc["commandId"] | "";
-
     DynamicJsonDocument data(64);
     data["success"] = true;
     data["message"] = "Device restarting...";
@@ -1386,10 +1395,6 @@ bool connectToWifi(String ssid, String password) {
       connectToMqtt();
     }
 
-    if (localStorage) {
-      fetchAndStoreSchedules();
-    }
-
     isConnecting = false;
     return true;
   } else {
@@ -1470,13 +1475,24 @@ void handleRFID() {
       return;
     }
 
+    DateTime currentTime = getLocalTime();
+    int currentDOW = currentTime.dayOfTheWeek();
+    currentDOW = (currentDOW == 0) ? 7 : currentDOW;
+
+    // ✅ OPTIMIZED: Single loop - card exist + today schedule dono check
+    const UserSchedule* todaysSchedule = nullptr;
     bool foundInSchedule = false;
+
     for (const auto& schedule : userSchedules) {
       if (schedule.cardUuid == cardUuid) {
         foundInSchedule = true;
-        break;
+        if (schedule.dayOfWeek == currentDOW) {
+          todaysSchedule = &schedule;
+          break;
+        }
       }
     }
+
     if (!foundInSchedule) {
       Serial.println("Card not found in local schedule");
       blinkRedTwice();
@@ -1486,17 +1502,6 @@ void handleRFID() {
       return;
     }
 
-    DateTime currentTime = getLocalTime();
-    int currentDOW = currentTime.dayOfTheWeek();
-    currentDOW = (currentDOW == 0) ? 7 : currentDOW;
-
-    const UserSchedule* todaysSchedule = nullptr;
-    for (const auto& schedule : userSchedules) {
-      if (schedule.cardUuid == cardUuid && schedule.dayOfWeek == currentDOW) {
-        todaysSchedule = &schedule;
-        break;
-      }
-    }
     if (!todaysSchedule) {
       Serial.println("❌ No schedule for today");
       blinkRedTwice();
@@ -1861,8 +1866,6 @@ AttendanceResult processLocalAttendance(
     }
   }
 
-  // === FIXED LOGIC ORDER - EXACTLY LIKE YOUR WORKING COMMENTED CODE ===
-
   // CASE 1: USER HASN'T CHECKED IN TODAY
   if (todaysCheckIns.size() == 0) {
     if (isBeforeCheckInWindow) {
@@ -1992,171 +1995,274 @@ bool saveAttendanceLogToSD(
   const String& checkOutWindow) {
 
   if (!sdMounted) {
+    Serial.println("SD Not Mounted");
     return false;
   }
 
-  char filename[32];
   DateTime now = rtc.now();
-  sprintf(filename, "%s%04d%02d%02d.csv",
+
+  // Daily log (same as before)
+  char dailyFilename[64];
+  sprintf(dailyFilename, "%s%04d%02d%02d.csv",
           DAILY_LOG_PREFIX, now.year(), now.month(), now.day());
 
-  bool fileExists = SD.exists(filename);
+  bool dailyExists = SD.exists(dailyFilename);
 
-  File file = SD.open(filename, FILE_WRITE);
-  if (!file) {
+  File dailyFile = SD.open(dailyFilename, FILE_WRITE);
+  if (!dailyFile) {
+    Serial.println("Failed to open daily file: " + String(dailyFilename));
     return false;
   }
 
-  Serial.print("Writing attendance to: ");
-  Serial.println(filename);
-
-  if (fileExists) {
-    if (!file.seek(file.size())) {
-      file.close();
-      return false;
-    }
-  } else {
-    file.println("Timestamp,CardUUID,UserID,UserName,Type,Status,Message,DayOfWeek,CheckInWindow,CheckOutWindow");
+  if (!dailyExists) {
+    dailyFile.println("Timestamp,CardUUID,UserID,UserName,Type,Status,Message,DayOfWeek,CheckInWindow,CheckOutWindow");
   }
 
   String line = timestamp + "," + cardUuid + "," + String(userId) + "," + userName + "," + recordType + "," + status + "," + message + "," + dayOfWeek + "," + checkInWindow + "," + checkOutWindow;
 
-  file.println(line);
-  file.close();
+  dailyFile.println(line);
+  dailyFile.flush();
+  dailyFile.close();
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, now.year(), now.month());
+  Serial.println("Daily attendance saved → " + String(dailyFilename));
 
-  bool monthlyExists = SD.exists(monthlyFilename);
+  // Monthly per-user in month folder
+  char monthFolder[32];
+  sprintf(monthFolder, "/attendance/%04d-%02d", now.year(), now.month());
 
-  File monthlyFile = SD.open(monthlyFilename, FILE_WRITE);
-  if (monthlyFile) {
-    if (monthlyExists) {
-      monthlyFile.seek(monthlyFile.size());
+  // Debug: Root folder check
+  if (!SD.exists("/attendance")) {
+    Serial.println("Root /attendance does not exist. Trying to create...");
+    if (SD.mkdir("/attendance")) {
+      Serial.println("Successfully created root /attendance folder");
     } else {
-      monthlyFile.println("Timestamp,CardUUID,UserID,UserName,Type,Status,Message,DayOfWeek,CheckInWindow,CheckOutWindow");
+      Serial.println("CRITICAL: Failed to create root /attendance folder! Continuing anyway...");
+      // Abhi skip kar ke month folder direct try karenge
     }
-    monthlyFile.println(line);
-    monthlyFile.close();
+  } else {
+    Serial.println("Root /attendance already exists");
   }
+
+  // Month folder check & create
+  Serial.println("Checking month folder: " + String(monthFolder));
+  if (!SD.exists(monthFolder)) {
+    Serial.println("Month folder does not exist. Creating...");
+    if (SD.mkdir(monthFolder)) {
+      Serial.println("Successfully created month folder: " + String(monthFolder));
+    } else {
+      Serial.println("Failed to create month folder: " + String(monthFolder));
+      // Agar fail ho to monthly save skip karo, lekin daily to chalta rahe
+      return true;  // Daily to save ho gaya, return true
+    }
+  } else {
+    Serial.println("Month folder already exists");
+  }
+
+  // User file
+  String userFilePath = String(monthFolder) + "/" + cardUuid + ".csv";
+  Serial.println("User monthly file path: " + userFilePath);
+
+  bool userFileExists = SD.exists(userFilePath.c_str());
+
+  File userFile;
+
+  if (userFileExists) {
+    // Pehle read mode mein open karo size pata karne ke liye
+    File tempRead = SD.open(userFilePath.c_str(), FILE_READ);
+    uint32_t fileSize = 0;
+    if (tempRead) {
+      fileSize = tempRead.size();
+      tempRead.close();
+    }
+
+    userFile = SD.open(userFilePath.c_str(), FILE_WRITE);
+    if (!userFile) {
+      Serial.println("Failed to open user monthly file for append: " + userFilePath);
+      return true;
+    }
+    userFile.seek(fileSize);
+    Serial.println("Appending to existing user file at position: " + String(fileSize));
+
+  } else {
+    userFile = SD.open(userFilePath.c_str(), FILE_WRITE);
+    if (!userFile) {
+      Serial.println("Failed to create user monthly file: " + userFilePath);
+      return true;
+    }
+    userFile.println("Timestamp,CardUUID,UserID,UserName,Type,Status,Message,DayOfWeek,CheckInWindow,CheckOutWindow");
+    Serial.println("Created new user monthly file with header");
+  }
+
+  userFile.println(line);
+  userFile.flush();
+  userFile.close();
+
+  Serial.println("Monthly attendance saved (per user) → " + userFilePath);
 
   return true;
 }
 
 void saveScheduleToSD() {
+  if (!sdMounted) {
+    Serial.println("❌ SD not mounted - cannot save schedules");
+    return;
+  }
 
-  if (SD.exists(SCHEDULE_FILE)) {
-    if (!SD.remove(SCHEDULE_FILE)) {
-      Serial.println("❌ Cannot remove old schedule file!");
+  // Folder banao
+  if (!SD.exists(SCHEDULES_FOLDER)) {
+    if (SD.mkdir(SCHEDULES_FOLDER)) {
+      Serial.println("📁 Created schedules folder: " + String(SCHEDULES_FOLDER));
+    } else {
+      Serial.println("❌ Failed to create schedules folder!");
       return;
     }
   }
 
-  File file = SD.open(SCHEDULE_FILE, FILE_WRITE);
-  if (file) {
-    file.seek(0);
-    file.truncate(0);
-  }
-  if (!file) {
-    Serial.println("❌ Open failed");
-    return;
-  }
-
-  DynamicJsonDocument doc(4096);
-  JsonArray users = doc.createNestedArray("users");
-
-  for (auto& u : userSchedules) {
-    JsonObject o = users.createNestedObject();
-    o["id"] = u.userId;
-    o["cardUuid"] = u.cardUuid;
-    o["name"] = u.userName;
-    o["dayOfWeek"] = u.dayOfWeek;
-    o["checkInFrom"] = u.checkInFrom;
-    o["checkInTo"] = u.checkInTo;
-    o["checkOutFrom"] = u.checkOutFrom;
-    o["checkOutTo"] = u.checkOutTo;
+  // Unique cardUuid collect karo (simple vector use karke)
+  std::vector<String> uniqueUuids;
+  for (auto& sched : userSchedules) {
+    bool found = false;
+    for (auto& u : uniqueUuids) {
+      if (u == sched.cardUuid) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      uniqueUuids.push_back(sched.cardUuid);
+    }
   }
 
-  String output;
-  serializeJson(doc, output);
-  file.print(output);
-  file.flush();
-  file.close();
+  Serial.printf("Saving %d unique users to separate CSV files...\n", uniqueUuids.size());
 
-  Serial.println("✅ Clean schedule saved");
+  // Har unique UUID ke liye file banao
+  for (auto& cardUuid : uniqueUuids) {
+    String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+
+    // Purani file delete
+    if (SD.exists(filePath.c_str())) {
+      SD.remove(filePath.c_str());
+    }
+
+    File file = SD.open(filePath.c_str(), FILE_WRITE);
+    if (!file) {
+      Serial.println("❌ Failed to create file: " + filePath);
+      continue;
+    }
+
+    file.println("userId,userName,dayOfWeek,checkInFrom,checkInTo,checkOutFrom,checkOutTo");
+
+    // Is UUID ke saare schedules likho
+    for (auto& s : userSchedules) {
+      if (s.cardUuid == cardUuid) {
+        String line = String(s.userId) + "," + s.userName + "," + String(s.dayOfWeek) + "," + s.checkInFrom + "," + s.checkInTo + "," + s.checkOutFrom + "," + s.checkOutTo;
+        file.println(line);
+      }
+    }
+
+    file.flush();
+    file.close();
+
+    Serial.printf("Saved schedules for card %s → %s\n", cardUuid.c_str(), filePath.c_str());
+  }
+
+  Serial.println("✅ All user schedules saved as separate CSV files");
 }
 
 bool loadScheduleFromSD() {
-  Serial.println("📂 === LOADING SCHEDULES FROM SD ===");
+  Serial.println("📂 === LOADING SCHEDULES FROM /schedules/ FOLDER ===");
 
-  if (!SD.exists(SCHEDULE_FILE)) {
-    Serial.println("⚠️ No schedule file found on SD");
+  if (!sdMounted) {
+    Serial.println("SD not mounted");
     return false;
   }
 
-  // Get file size first
-  File checkFile = SD.open(SCHEDULE_FILE, FILE_READ);
-  if (checkFile) {
-    Serial.printf("📁 File size: %d bytes\n", checkFile.size());
-    checkFile.close();
-  }
-
-  File file = SD.open(SCHEDULE_FILE, FILE_READ);
-  if (!file) {
-    Serial.println("❌ Failed to open schedule file for reading!");
+  if (!SD.exists(SCHEDULES_FOLDER)) {
+    Serial.println("⚠️ No schedules folder found");
     return false;
   }
-
-  // Check if file is empty
-  if (file.size() == 0) {
-    Serial.println("❌ Schedule file is empty!");
-    file.close();
-    return false;
-  }
-
-  DynamicJsonDocument doc(8192);  // Increased buffer size
-
-  String json = file.readString();
-  file.close();
-
-  Serial.println("RAW JSON:");
-  Serial.println(json);
-
-  DeserializationError error = deserializeJson(doc, json);
-  if (error) {
-    Serial.printf("❌ JSON parse error: %s\n", error.c_str());
-    file.close();
-    return false;
-  }
-  file.close();
 
   userSchedules.clear();
 
-  JsonArray usersArray = doc["users"].as<JsonArray>();
-  Serial.printf("Found %d users in schedule file\n", usersArray.size());
-
-  for (JsonObject u : usersArray) {
-    UserSchedule s;
-    s.userId = u["id"] | 0;
-    s.cardUuid = u["cardUuid"].as<String>();
-    s.userName = u["name"].as<String>();
-    s.dayOfWeek = u["dayOfWeek"] | 0;
-    s.checkInFrom = u["checkInFrom"].as<String>();
-    s.checkInTo = u["checkInTo"].as<String>();
-    s.checkOutFrom = u["checkOutFrom"].as<String>();
-    s.checkOutTo = u["checkOutTo"].as<String>();
-
-    userSchedules.push_back(s);
-
-    Serial.printf("  Loaded: User %d (%s) Day %d, Card: %s\n",
-                  s.userId, s.userName.c_str(), s.dayOfWeek, s.cardUuid.c_str());
+  File dir = SD.open(SCHEDULES_FOLDER);
+  if (!dir) {
+    Serial.println("❌ Failed to open schedules folder");
+    return false;
   }
 
-  Serial.printf("✅ Loaded schedules from SD: %d\n", userSchedules.size());
-  Serial.println("📂 === LOAD COMPLETE ===\n");
+  int totalSchedules = 0;
+  int totalUsers = 0;
 
-  return true;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+
+    if (entry.isDirectory()) {
+      entry.close();
+      continue;
+    }
+
+    String fileName = entry.name();
+    if (!fileName.endsWith(".csv")) {
+      entry.close();
+      continue;
+    }
+
+    // cardUuid nikaalo (filename se .csv hata ke)
+    String cardUuid = fileName.substring(0, fileName.length() - 4);
+
+    File csvFile = SD.open(String(SCHEDULES_FOLDER) + fileName, FILE_READ);
+    if (!csvFile) {
+      Serial.println("Failed to open: " + fileName);
+      entry.close();
+      continue;
+    }
+
+    // Header skip
+    csvFile.readStringUntil('\n');
+
+    while (csvFile.available()) {
+      String line = csvFile.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+
+      // CSV parse (simple comma split)
+      int pos1 = line.indexOf(',');
+      int pos2 = line.indexOf(',', pos1 + 1);
+      int pos3 = line.indexOf(',', pos2 + 1);
+      int pos4 = line.indexOf(',', pos3 + 1);
+      int pos5 = line.indexOf(',', pos4 + 1);
+      int pos6 = line.indexOf(',', pos5 + 1);
+
+      if (pos6 == -1) continue;  // invalid line
+
+      UserSchedule s;
+      s.cardUuid = cardUuid;
+      s.userId = line.substring(0, pos1).toInt();
+      s.userName = line.substring(pos1 + 1, pos2);
+      s.dayOfWeek = line.substring(pos2 + 1, pos3).toInt();
+      s.checkInFrom = line.substring(pos3 + 1, pos4);
+      s.checkInTo = line.substring(pos4 + 1, pos5);
+      s.checkOutFrom = line.substring(pos5 + 1, pos6);
+      s.checkOutTo = line.substring(pos6 + 1);
+
+      userSchedules.push_back(s);
+      totalSchedules++;
+    }
+
+    csvFile.close();
+    entry.close();
+
+    totalUsers++;
+    Serial.printf("Loaded %d schedules from %s\n", totalSchedules, fileName.c_str());
+  }
+
+  dir.close();
+
+  Serial.printf("✅ Loaded total %d schedules for %d users from SD\n",
+                totalSchedules, totalUsers);
+
+  return totalSchedules > 0;
 }
 
 void loadTodayRecordsFromSD() {
@@ -2301,127 +2407,162 @@ bool syncMonthlyRecordsToServer(int year, int month) {
   }
 
   if (isSyncing) return false;
-
   isSyncing = true;
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+  char monthFolder[32];
+  sprintf(monthFolder, ATTENDANCE_FOLDER "%04d-%02d/", year, month);
 
-  if (!SD.exists(monthlyFilename)) {
+  if (!SD.exists(monthFolder)) {
+    Serial.println("No attendance folder for " + String(monthFolder) + " - nothing to sync");
     isSyncing = false;
     return false;
   }
 
-  File file = SD.open(monthlyFilename, FILE_READ);
-  if (!file) {
+  Serial.println("Syncing monthly attendance folder: " + String(monthFolder));
+
+  File dir = SD.open(monthFolder);
+  if (!dir) {
+    Serial.println("Failed to open month folder");
     isSyncing = false;
     return false;
   }
 
-  String header = file.readStringUntil('\n');
+  int totalSynced = 0;
+  int totalFailed = 0;
 
-  int totalRecords = 0;
-  int syncedRecords = 0;
-  int failedRecords = 0;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
 
-  char tempFilename[32];
-  sprintf(tempFilename, "%s%04d_%02d_temp.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+    if (entry.isDirectory()) {
+      entry.close();
+      continue;
+    }
 
-  File tempFile = SD.open(tempFilename, FILE_WRITE);
-  if (!tempFile) {
-    file.close();
-    isSyncing = false;
-    return false;
-  }
+    String fileName = entry.name();
+    if (!fileName.endsWith(".csv")) {
+      entry.close();
+      continue;
+    }
 
-  tempFile.println(header);
+    // fileName = 31F66816.csv
+    String cardUuid = fileName.substring(0, fileName.length() - 4);
 
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
+    Serial.println("Syncing user file: " + fileName);
 
-    totalRecords++;
+    File file = SD.open(String(monthFolder) + fileName, FILE_READ);
+    if (!file) {
+      entry.close();
+      continue;
+    }
 
-    int commaIndex = 0;
-    int startPos = 0;
-    int fieldIndex = 0;
+    String header = file.readStringUntil('\n');
 
-    String timestamp, cardUuid, userId, userName, recordType, status, message, dayOfWeek, checkInWindow, checkOutWindow;
+    String tempFilePath = String(monthFolder) + "temp_" + fileName;
 
-    while (startPos < line.length()) {
-      commaIndex = line.indexOf(',', startPos);
-      if (commaIndex == -1) commaIndex = line.length();
+    File tempFile = SD.open(tempFilePath.c_str(), FILE_WRITE);
+    if (!tempFile) {
+      file.close();
+      entry.close();
+      continue;
+    }
 
-      String field = line.substring(startPos, commaIndex);
+    tempFile.println(header);
 
-      switch (fieldIndex) {
-        case 0: timestamp = field; break;
-        case 1: cardUuid = field; break;
-        case 2: userId = field; break;
-        case 3: userName = field; break;
-        case 4: recordType = field; break;
-        case 5: status = field; break;
-        case 6: message = field; break;
-        case 7: dayOfWeek = field; break;
-        case 8: checkInWindow = field; break;
-        case 9: checkOutWindow = field; break;
+    int synced = 0;
+    int failed = 0;
+
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+
+      int commaIndex = 0;
+      int startPos = 0;
+      int fieldIndex = 0;
+
+      String timestamp, userIdStr, userName;
+      String recordType, status, message;
+      String dayOfWeek, checkInWindow, checkOutWindow;
+
+      while (startPos < line.length()) {
+        commaIndex = line.indexOf(',', startPos);
+        if (commaIndex == -1) commaIndex = line.length();
+
+        String field = line.substring(startPos, commaIndex);
+
+        switch (fieldIndex) {
+          case 0: timestamp = field; break;
+          case 1: /* cardUuid skip - file name se mil raha hai */ break;
+          case 2: userIdStr = field; break;
+          case 3: userName = field; break;
+          case 4: recordType = field; break;
+          case 5: status = field; break;
+          case 6: message = field; break;
+          case 7: dayOfWeek = field; break;
+          case 8: checkInWindow = field; break;
+          case 9: checkOutWindow = field; break;
+        }
+
+        startPos = commaIndex + 1;
+        fieldIndex++;
       }
 
-      startPos = commaIndex + 1;
-      fieldIndex++;
+      if (fieldIndex < 10) {
+        Serial.println("⚠️ Invalid CSV line, skipping");
+        continue;
+      }
+
+      int userId = userIdStr.toInt();
+
+      bool sent = sendAttendanceRecordToServer(
+        cardUuid,
+        userId,
+        userName,
+        timestamp,
+        recordType,
+        status,
+        message,
+        dayOfWeek,
+        checkInWindow,
+        checkOutWindow);
+
+      if (sent) {
+        synced++;
+        totalSynced++;
+      } else {
+        failed++;
+        totalFailed++;
+        tempFile.println(line);
+      }
+
+      delay(50);
     }
 
-    bool sent = sendAttendanceRecordToServer(
-      cardUuid,
-      userId.toInt(),
-      userName,
-      timestamp,
-      recordType,
-      status,
-      message,
-      dayOfWeek,
-      checkInWindow,
-      checkOutWindow);
+    file.close();
+    tempFile.close();
 
-    if (sent) {
-      syncedRecords++;
+    // Cleanup
+    String originalPath = String(monthFolder) + fileName;
+    SD.remove(originalPath.c_str());
+    if (failed > 0) {
+      SD.rename(tempFilePath.c_str(), originalPath.c_str());
+      Serial.printf("User %s: %d synced, %d failed → kept local\n", cardUuid.c_str(), synced, failed);
     } else {
-      failedRecords++;
-      tempFile.println(line);
+      SD.remove(tempFilePath.c_str());
+      Serial.printf("User %s: All %d records synced → removed local copy\n", cardUuid.c_str(), synced);
     }
 
-    delay(100);
+    entry.close();
   }
 
-  file.close();
-  tempFile.close();
+  dir.close();
 
-  Serial.println("\n========== SYNC SUMMARY ==========");
-  Serial.print("Total Records: ");
-  Serial.println(totalRecords);
-
-  Serial.print("Synced: ");
-  Serial.println(syncedRecords);
-
-  Serial.print("Failed: ");
-  Serial.println(failedRecords);
-
-  SD.remove(monthlyFilename);
-  if (failedRecords > 0) {
-    SD.rename(tempFilename, monthlyFilename);
-    Serial.println("⚠️ Some records failed, temp file renamed back to original");
-  } else {
-    SD.remove(tempFilename);
-    Serial.println("🎉 All records synced, temp file removed");
-  }
-
+  Serial.printf("Monthly sync complete for %04d-%02d: Total synced %d, failed %d\n",
+                year, month, totalSynced, totalFailed);
   isSyncing = false;
 
-  Serial.println("========== MONTHLY SYNC END ==========\n");
-  return syncedRecords > 0;
+  return totalSynced > 0;
 }
 
 bool sendAttendanceRecordToServer(
@@ -2699,7 +2840,7 @@ String deleteUserAttendanceRecords(String targetCardUuid) {
     loadTodayRecordsFromSD();
   }
 
-  String response = "{\"success\":true,\"message\":\"Records deleted successfully\",";
+  String response = "{\"success\":true,\"message\":\"Daily records deleted successfully\",";
   response += "\"deletedCount\":" + String(deletedCount) + ",";
   response += "\"totalCount\":" + String(totalCount) + "}";
 
@@ -2711,80 +2852,114 @@ String getMonthlyAttendanceRecords(int year, int month) {
     return "{\"success\":false,\"message\":\"SD card not mounted\"}";
   }
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+  char monthFolder[32];
+  sprintf(monthFolder, "/attendance/%04d-%02d", year, month);
 
-  if (!SD.exists(monthlyFilename)) {
+  Serial.println("DEBUG monthFolder: " + String(monthFolder));
+  Serial.println("DEBUG folder exists: " + String(SD.exists(monthFolder) ? "YES" : "NO"));
+
+  if (!SD.exists(monthFolder)) {
     return "{\"success\":true,\"message\":\"No records for this month\",\"data\":[]}";
   }
 
-  File file = SD.open(monthlyFilename, FILE_READ);
-  if (!file) {
-    return "{\"success\":false,\"message\":\"Failed to open monthly file\"}";
+  File dir = SD.open(monthFolder);
+  if (!dir) {
+    return "{\"success\":false,\"message\":\"Failed to open month folder\"}";
   }
 
-  String jsonResponse = "{\"success\":true,\"message\":\"Monthly records fetched successfully\",\"data\":[";
+  Serial.println("DEBUG dir opened successfully");
 
-  String header = file.readStringUntil('\n');
+  String jsonResponse = "{\"success\":true,\"message\":\"Monthly records fetched\",\"data\":[";
+  bool firstRecord = true;
 
-  bool firstLine = true;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      Serial.println("DEBUG no more entries");
+      break;
+    }
 
-    int commaIndex = 0;
-    int startPos = 0;
-    int fieldIndex = 0;
+    Serial.println("DEBUG entry.name(): " + String(entry.name()));
+    Serial.println("DEBUG isDirectory: " + String(entry.isDirectory() ? "YES" : "NO"));
 
-    String timestamp, cardUuid, userId, userName, recordType, status, message, dayOfWeek, checkInWindow, checkOutWindow;
+    if (entry.isDirectory()) {
+      entry.close();
+      continue;
+    }
 
-    while (startPos < line.length()) {
-      commaIndex = line.indexOf(',', startPos);
-      if (commaIndex == -1) commaIndex = line.length();
+    // entry.name() full path deta hai ESP8266 par, sirf filename lo
+    String fullName = String(entry.name());
+    int lastSlash = fullName.lastIndexOf('/');
+    String fileName = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
 
-      String field = line.substring(startPos, commaIndex);
+    Serial.println("DEBUG fileName after parse: " + fileName);
 
-      switch (fieldIndex) {
-        case 0: timestamp = field; break;
-        case 1: cardUuid = field; break;
-        case 2: userId = field; break;
-        case 3: userName = field; break;
-        case 4: recordType = field; break;
-        case 5: status = field; break;
-        case 6: message = field; break;
-        case 7: dayOfWeek = field; break;
-        case 8: checkInWindow = field; break;
-        case 9: checkOutWindow = field; break;
+    if (!fileName.endsWith(".csv") || fileName.startsWith("temp_")) {
+      entry.close();
+      continue;
+    }
+
+    String cardUuid = fileName.substring(0, fileName.length() - 4);
+    Serial.println("Reading file for cardUuid: " + cardUuid);
+
+    String filePath = String(monthFolder) + "/" + fileName;
+    File file = SD.open(filePath.c_str(), FILE_READ);
+    if (!file) {
+      entry.close();
+      continue;
+    }
+
+    file.readStringUntil('\n');
+
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+
+      // Parse fields
+      int pos[9];
+      int sp = 0;
+      for (int i = 0; i < 9; i++) {
+        pos[i] = line.indexOf(',', sp);
+        if (pos[i] == -1) pos[i] = line.length();
+        sp = pos[i] + 1;
       }
 
-      startPos = commaIndex + 1;
-      fieldIndex++;
+      String timestamp = line.substring(0, pos[0]);
+      // field 1 = cardUuid in file (same as filename), skip
+      String userIdStr = line.substring(pos[1] + 1, pos[2]);
+      String userName = line.substring(pos[2] + 1, pos[3]);
+      String recordType = line.substring(pos[3] + 1, pos[4]);
+      String status = line.substring(pos[4] + 1, pos[5]);
+      String message = line.substring(pos[5] + 1, pos[6]);
+      String dayOfWeek = line.substring(pos[6] + 1, pos[7]);
+      String checkIn = line.substring(pos[7] + 1, pos[8]);
+      String checkOut = line.substring(pos[8] + 1);
+      checkOut.trim();
+
+      if (!firstRecord) jsonResponse += ",";
+      firstRecord = false;
+
+      jsonResponse += "{";
+      jsonResponse += "\"timestamp\":\"" + timestamp + "\",";
+      jsonResponse += "\"cardUuid\":\"" + cardUuid + "\",";
+      jsonResponse += "\"userId\":" + userIdStr + ",";
+      jsonResponse += "\"userName\":\"" + userName + "\",";
+      jsonResponse += "\"recordType\":\"" + recordType + "\",";
+      jsonResponse += "\"status\":\"" + status + "\",";
+      jsonResponse += "\"message\":\"" + message + "\",";
+      jsonResponse += "\"dayOfWeek\":\"" + dayOfWeek + "\",";
+      jsonResponse += "\"checkInWindow\":\"" + checkIn + "\",";
+      jsonResponse += "\"checkOutWindow\":\"" + checkOut + "\"";
+      jsonResponse += "}";
     }
 
-    if (!firstLine) {
-      jsonResponse += ",";
-    }
-    firstLine = false;
-
-    jsonResponse += "{";
-    jsonResponse += "\"timestamp\":\"" + timestamp + "\",";
-    jsonResponse += "\"cardUuid\":\"" + cardUuid + "\",";
-    jsonResponse += "\"userId\":" + userId + ",";
-    jsonResponse += "\"userName\":\"" + userName + "\",";
-    jsonResponse += "\"recordType\":\"" + recordType + "\",";
-    jsonResponse += "\"status\":\"" + status + "\",";
-    jsonResponse += "\"message\":\"" + message + "\",";
-    jsonResponse += "\"dayOfWeek\":\"" + dayOfWeek + "\",";
-    jsonResponse += "\"checkInWindow\":\"" + checkInWindow + "\",";
-    jsonResponse += "\"checkOutWindow\":\"" + checkOutWindow + "\"";
-    jsonResponse += "}";
+    file.close();
+    entry.close();
   }
 
-  file.close();
+  dir.close();
   jsonResponse += "]}";
-
   return jsonResponse;
 }
 
@@ -2793,189 +2968,165 @@ String getUserMonthlyRecords(String targetCardUuid, int year, int month) {
     return "{\"success\":false,\"message\":\"SD card not mounted\"}";
   }
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+  char filePath[80];
+  sprintf(filePath, "/attendance/%04d-%02d/%s.csv", year, month, targetCardUuid.c_str());
 
-  if (!SD.exists(monthlyFilename)) {
-    return "{\"success\":true,\"message\":\"No records for this month\",\"data\":[]}";
+  Serial.println("Looking for user monthly file: " + String(filePath));
+
+  if (!SD.exists(filePath)) {
+    return "{\"success\":true,\"message\":\"No records for this user\",\"data\":[]}";
   }
 
-  File file = SD.open(monthlyFilename, FILE_READ);
+  File file = SD.open(filePath, FILE_READ);
   if (!file) {
-    return "{\"success\":false,\"message\":\"Failed to open monthly file\"}";
+    return "{\"success\":false,\"message\":\"Failed to open user file\"}";
   }
 
-  String jsonResponse = "{\"success\":true,\"message\":\"User monthly records fetched successfully\",\"data\":[";
+  String jsonResponse = "{\"success\":true,\"message\":\"User monthly records fetched\",\"data\":[";
+  bool firstRecord = true;
 
-  String header = file.readStringUntil('\n');
+  file.readStringUntil('\n');
 
-  bool firstLine = true;
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
 
-    int commaIndex = 0;
-    int startPos = 0;
-    int fieldIndex = 0;
-
-    String timestamp, cardUuid, userId, userName, recordType, status, message, dayOfWeek, checkInWindow, checkOutWindow;
-
-    while (startPos < line.length()) {
-      commaIndex = line.indexOf(',', startPos);
-      if (commaIndex == -1) commaIndex = line.length();
-
-      String field = line.substring(startPos, commaIndex);
-
-      switch (fieldIndex) {
-        case 0: timestamp = field; break;
-        case 1: cardUuid = field; break;
-        case 2: userId = field; break;
-        case 3: userName = field; break;
-        case 4: recordType = field; break;
-        case 5: status = field; break;
-        case 6: message = field; break;
-        case 7: dayOfWeek = field; break;
-        case 8: checkInWindow = field; break;
-        case 9: checkOutWindow = field; break;
-      }
-
-      startPos = commaIndex + 1;
-      fieldIndex++;
+    int pos[9];
+    int sp = 0;
+    for (int i = 0; i < 9; i++) {
+      pos[i] = line.indexOf(',', sp);
+      if (pos[i] == -1) pos[i] = line.length();
+      sp = pos[i] + 1;
     }
 
-    if (cardUuid == targetCardUuid) {
-      if (!firstLine) {
-        jsonResponse += ",";
-      }
-      firstLine = false;
+    String timestamp = line.substring(0, pos[0]);
+    String userIdStr = line.substring(pos[1] + 1, pos[2]);
+    String userName = line.substring(pos[2] + 1, pos[3]);
+    String recordType = line.substring(pos[3] + 1, pos[4]);
+    String status = line.substring(pos[4] + 1, pos[5]);
+    String message = line.substring(pos[5] + 1, pos[6]);
+    String dayOfWeek = line.substring(pos[6] + 1, pos[7]);
+    String checkIn = line.substring(pos[7] + 1, pos[8]);
+    String checkOut = line.substring(pos[8] + 1);
+    checkOut.trim();
 
-      jsonResponse += "{";
-      jsonResponse += "\"timestamp\":\"" + timestamp + "\",";
-      jsonResponse += "\"cardUuid\":\"" + cardUuid + "\",";
-      jsonResponse += "\"userId\":" + userId + ",";
-      jsonResponse += "\"userName\":\"" + userName + "\",";
-      jsonResponse += "\"recordType\":\"" + recordType + "\",";
-      jsonResponse += "\"status\":\"" + status + "\",";
-      jsonResponse += "\"message\":\"" + message + "\",";
-      jsonResponse += "\"dayOfWeek\":\"" + dayOfWeek + "\",";
-      jsonResponse += "\"checkInWindow\":\"" + checkInWindow + "\",";
-      jsonResponse += "\"checkOutWindow\":\"" + checkOutWindow + "\"";
-      jsonResponse += "}";
-    }
+    if (!firstRecord) jsonResponse += ",";
+    firstRecord = false;
+
+    jsonResponse += "{";
+    jsonResponse += "\"timestamp\":\"" + timestamp + "\",";
+    jsonResponse += "\"cardUuid\":\"" + targetCardUuid + "\",";
+    jsonResponse += "\"userId\":" + userIdStr + ",";
+    jsonResponse += "\"userName\":\"" + userName + "\",";
+    jsonResponse += "\"recordType\":\"" + recordType + "\",";
+    jsonResponse += "\"status\":\"" + status + "\",";
+    jsonResponse += "\"message\":\"" + message + "\",";
+    jsonResponse += "\"dayOfWeek\":\"" + dayOfWeek + "\",";
+    jsonResponse += "\"checkInWindow\":\"" + checkIn + "\",";
+    jsonResponse += "\"checkOutWindow\":\"" + checkOut + "\"";
+    jsonResponse += "}";
   }
 
   file.close();
   jsonResponse += "]}";
-
   return jsonResponse;
 }
 
+// ================== DELETE ENTIRE MONTH FOLDER ==================
 String deleteMonthlyFile(int year, int month) {
   if (!sdMounted) {
     return "{\"success\":false,\"message\":\"SD card not mounted\"}";
   }
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+  char monthFolder[32];
+  sprintf(monthFolder, "/attendance/%04d-%02d", year, month);
 
-  if (!SD.exists(monthlyFilename)) {
-    return "{\"success\":false,\"message\":\"Monthly file not found\"}";
+  if (!SD.exists(monthFolder)) {
+    return "{\"success\":false,\"message\":\"No records found for this month\"}";
   }
 
-  bool deleted = SD.remove(monthlyFilename);
+  // Pehle folder ke andar saari files delete karo
+  File dir = SD.open(monthFolder);
+  if (!dir) {
+    return "{\"success\":false,\"message\":\"Failed to open month folder\"}";
+  }
 
-  if (deleted) {
-    return "{\"success\":true,\"message\":\"Monthly file deleted successfully\"}";
+  int deletedFiles = 0;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+
+    if (!entry.isDirectory()) {
+      String fullName = String(entry.name());
+      int lastSlash = fullName.lastIndexOf('/');
+      String fileName = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
+      String filePath = String(monthFolder) + "/" + fileName;
+      entry.close();
+
+      if (SD.remove(filePath.c_str())) {
+        deletedFiles++;
+        Serial.println("Deleted: " + filePath);
+      } else {
+        Serial.println("Failed to delete: " + filePath);
+      }
+    } else {
+      entry.close();
+    }
+  }
+  dir.close();
+
+  // Ab folder delete karo
+  if (SD.rmdir(monthFolder)) {
+    Serial.println("Month folder deleted: " + String(monthFolder));
+    String response = "{\"success\":true,\"message\":\"Monthly records deleted successfully\",";
+    response += "\"deletedFiles\":" + String(deletedFiles) + "}";
+    return response;
   } else {
-    return "{\"success\":false,\"message\":\"Failed to delete monthly file\"}";
+    // Folder delete na ho to bhi files to delete ho gayi
+    String response = "{\"success\":true,\"message\":\"Monthly files deleted (folder may remain)\",";
+    response += "\"deletedFiles\":" + String(deletedFiles) + "}";
+    return response;
   }
 }
 
+// ================== DELETE SPECIFIC USER FROM MONTH ==================
 String deleteUserFromMonthlyFile(String targetCardUuid, int year, int month) {
   if (!sdMounted) {
     return "{\"success\":false,\"message\":\"SD card not mounted\"}";
   }
 
-  char monthlyFilename[32];
-  sprintf(monthlyFilename, "%s%04d_%02d.csv",
-          MONTHLY_LOG_PREFIX, year, month);
+  char filePath[80];
+  sprintf(filePath, "/attendance/%04d-%02d/%s.csv", year, month, targetCardUuid.c_str());
 
-  if (!SD.exists(monthlyFilename)) {
-    return "{\"success\":false,\"message\":\"Monthly file not found\"}";
+  Serial.println("Deleting user file: " + String(filePath));
+
+  if (!SD.exists(filePath)) {
+    return "{\"success\":false,\"message\":\"No records found for this user\"}";
   }
 
-  char tempFilename[32];
-  sprintf(tempFilename, "%s%04d_%02d_temp.csv",
-          MONTHLY_LOG_PREFIX, year, month);
-
-  File originalFile = SD.open(monthlyFilename, FILE_READ);
-  if (!originalFile) {
-    return "{\"success\":false,\"message\":\"Failed to open monthly file\"}";
-  }
-
-  File tempFile = SD.open(tempFilename, FILE_WRITE);
-  if (!tempFile) {
-    originalFile.close();
-    return "{\"success\":false,\"message\":\"Failed to create temp file\"}";
-  }
-
-  int deletedCount = 0;
-  int totalCount = 0;
-
-  String header = originalFile.readStringUntil('\n');
-  tempFile.println(header);
-
-  while (originalFile.available()) {
-    String line = originalFile.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    totalCount++;
-
-    int commaIndex = 0;
-    int startPos = 0;
-    int fieldIndex = 0;
-    String cardUuid = "";
-
-    while (startPos < line.length() && fieldIndex <= 1) {
-      commaIndex = line.indexOf(',', startPos);
-      if (commaIndex == -1) commaIndex = line.length();
-
-      if (fieldIndex == 1) {
-        cardUuid = line.substring(startPos, commaIndex);
-        cardUuid.trim();
-        cardUuid.toUpperCase();
-        break;
-      }
-
-      startPos = commaIndex + 1;
-      fieldIndex++;
+  // File ka size count karo (records count ke liye)
+  File file = SD.open(filePath, FILE_READ);
+  int recordCount = 0;
+  if (file) {
+    file.readStringUntil('\n');
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0) recordCount++;
     }
-
-    if (cardUuid == targetCardUuid) {
-      deletedCount++;
-      continue;
-    }
-
-    tempFile.println(line);
+    file.close();
   }
 
-  originalFile.close();
-  tempFile.close();
-
-  SD.remove(monthlyFilename);
-  SD.rename(tempFilename, monthlyFilename);
-
-  if (deletedCount > 0) {
-    String response = "{\"success\":true,\"message\":\"User records deleted from monthly file\",";
-    response += "\"deletedCount\":" + String(deletedCount) + ",";
-    response += "\"totalCount\":" + String(totalCount) + "}";
+  // Direct file delete karo
+  if (SD.remove(filePath)) {
+    Serial.println("User file deleted: " + String(filePath));
+    String response = "{\"success\":true,\"message\":\"User records deleted successfully\",";
+    response += "\"deletedCount\":" + String(recordCount) + ",";
+    response += "\"cardUuid\":\"" + targetCardUuid + "\"}";
     return response;
   } else {
-    return "{\"success\":false,\"message\":\"No records found for this user\"}";
+    return "{\"success\":false,\"message\":\"Failed to delete user file\"}";
   }
 }
 
@@ -2989,6 +3140,7 @@ String listAllLogFiles() {
   JsonArray dailyFiles = data.createNestedArray("dailyFiles");
   JsonArray monthlyFiles = data.createNestedArray("monthlyFiles");
 
+  // ================== DAILY FILES (root mein) ==================
   File root = SD.open("/");
   if (!root) {
     return "{\"success\":false,\"message\":\"Failed to open root directory\",\"data\":{\"dailyFiles\":[],\"monthlyFiles\":[]}}";
@@ -2999,37 +3151,82 @@ String listAllLogFiles() {
     if (!entry) break;
 
     if (!entry.isDirectory()) {
-      String fileName = entry.name();
-      if (fileName.startsWith("/")) fileName = fileName.substring(1);
+      String fullName = String(entry.name());
+      int lastSlash = fullName.lastIndexOf('/');
+      String fileName = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
 
       if (fileName.startsWith("log_") && fileName.endsWith(".csv")) {
         JsonObject fileObj = dailyFiles.createNestedObject();
         fileObj["filename"] = fileName;
-        String dateStr = fileName.substring(strlen("log_"), fileName.length() - 4);
+        String dateStr = fileName.substring(4, fileName.length() - 4);
         fileObj["date"] = dateStr;
         fileObj["size"] = entry.size();
       }
-
-      if (fileName.startsWith("monthly_") && fileName.endsWith(".csv")) {
-        JsonObject fileObj = monthlyFiles.createNestedObject();
-        fileObj["filename"] = fileName;
-        String yearMonth = fileName.substring(strlen("monthly_"), fileName.length() - 4);
-        fileObj["yearMonth"] = yearMonth;
-        fileObj["size"] = entry.size();
-      }
     }
-
     entry.close();
   }
-
   root.close();
+
+  // ================== MONTHLY FILES (/attendance/ folder mein) ==================
+  if (SD.exists("/attendance")) {
+    File attendanceDir = SD.open("/attendance");
+    if (attendanceDir) {
+
+      while (true) {
+        File monthDir = attendanceDir.openNextFile();
+        if (!monthDir) break;
+
+        if (!monthDir.isDirectory()) {
+          monthDir.close();
+          continue;
+        }
+
+        String monthDirName = String(monthDir.name());
+        int lastSlash = monthDirName.lastIndexOf('/');
+        String monthFolderName = (lastSlash >= 0) ? monthDirName.substring(lastSlash + 1) : monthDirName;
+
+        Serial.println("DEBUG monthFolder: " + monthFolderName);
+
+        String monthFolderPath = "/attendance/" + monthFolderName;
+        File userDir = SD.open(monthFolderPath.c_str());
+
+        if (userDir) {
+          while (true) {
+            File userFile = userDir.openNextFile();
+            if (!userFile) break;
+
+            if (!userFile.isDirectory()) {
+              String fullUserName = String(userFile.name());
+              int lastSlashU = fullUserName.lastIndexOf('/');
+              String userFileName = (lastSlashU >= 0) ? fullUserName.substring(lastSlashU + 1) : fullUserName;
+
+              if (userFileName.endsWith(".csv") && !userFileName.startsWith("temp_")) {
+                String cardUuid = userFileName.substring(0, userFileName.length() - 4);
+
+                JsonObject fileObj = monthlyFiles.createNestedObject();
+                fileObj["filename"] = userFileName;
+                fileObj["cardUuid"] = cardUuid;
+                fileObj["yearMonth"] = monthFolderName;
+                fileObj["path"] = monthFolderPath + "/" + userFileName;
+                fileObj["size"] = userFile.size();
+              }
+            }
+            userFile.close();
+          }
+          userDir.close();
+        }
+
+        monthDir.close();
+      }
+      attendanceDir.close();
+    }
+  }
 
   doc["success"] = true;
   doc["message"] = "Files listed successfully";
 
   String response;
   serializeJson(doc, response);
-
   return response;
 }
 
@@ -3059,7 +3256,7 @@ void checkPendingWifiFailure() {
     DynamicJsonDocument data(128);
     data["success"] = false;
     data["message"] = "Failed connect to WiFi. Please check password";
-    data["ssid"] = "";  // SSID unknown now
+    data["ssid"] = "";
     if (commandId.length() > 0) {
       data["commandId"] = commandId;
     }
@@ -3206,13 +3403,6 @@ void setup() {
     Serial.println("Initial WiFi connection failed");
   }
 
-  // int wifiTimeout = 0;
-  // while (WiFi.status() != WL_CONNECTED && wifiTimeout < 40) {
-  //   delay(500);
-  //   Serial.print(".");
-  //   wifiTimeout++;
-  // }
-
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi Connected!");
     Serial.print("IP Address: ");
@@ -3221,11 +3411,6 @@ void setup() {
     setRTCFromNTP();
 
     connectToMqtt();
-
-    if (localStorage) {
-      Serial.println("Fetching fresh schedules from server...");
-      fetchAndStoreSchedules();
-    }
   } else {
     Serial.println("\nWiFi not connected, using offline mode");
   }
@@ -3315,10 +3500,10 @@ void loop() {
     }
 
     if (localStorage) {
-      if (currentMillis - lastScheduleUpdate >= scheduleUpdateInterval) {
-        fetchAndStoreSchedules();
-        lastScheduleUpdate = currentMillis;
-      }
+      // if (currentMillis - lastScheduleUpdate >= scheduleUpdateInterval) {
+      //   fetchAndStoreSchedules();
+      //   lastScheduleUpdate = currentMillis;
+      // }
 
       if (autoSyncEnabled && currentMillis - lastSyncTime >= SYNC_INTERVAL) {
         lastSyncTime = currentMillis;
