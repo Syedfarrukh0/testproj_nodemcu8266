@@ -39,10 +39,8 @@ PCF8574 pcf(PCF_ADDRESS);
 
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
-#define SCHEDULE_FILE "/schedule.json"
 #define SCHEDULES_FOLDER "/schedules/"
-#define ATTENDANCE_FOLDER "/attendance/"  // Root attendance folder
-#define MONTHLY_FOLDER_PREFIX "%04d_%02d/"
+#define ATTENDANCE_FOLDER "/attendance/"
 
 // ================== LED PINS on PCF8574 ==================
 #define WHITE_LED_PIN 0
@@ -69,17 +67,6 @@ int manualSecond = 0;
 #ifndef ATTENDANCE_LOGIC_H
 #define ATTENDANCE_LOGIC_H
 
-struct AttendanceSchedule {
-  int userId;
-  String cardUuid;
-  String userName;
-  int dayOfWeek;
-  String checkInFrom;
-  String checkInTo;
-  String checkOutFrom;
-  String checkOutTo;
-};
-
 struct AttendanceResult {
   bool success;
   String message;
@@ -100,8 +87,6 @@ struct TodaysRecord {
 
 // ================== CONFIG ==================
 #define HEARTBEAT_INTERVAL 30000
-#define SCAN_INTERVAL 15000
-#define SCHEDULE_UPDATE_INTERVAL 86400000
 #define FAIL_LIMIT 5
 #define DEFAULT_SERVER_URL "http://brayden-nonprovident-sizeably.ngrok-free.dev"
 String SERVER_URL = DEFAULT_SERVER_URL;
@@ -115,11 +100,9 @@ int timezoneOffsetMinutes = 0;
 
 // ================== GLOBAL VARIABLES ==================
 unsigned long lastHeartbeatTime = 0;
-unsigned long lastScanTime = 0;
 unsigned long lastLedToggle = 0;
-unsigned long lastConnectBlinkToggle = 0;
-unsigned long lastScheduleUpdate = 0;
-unsigned long scheduleUpdateInterval = 3600000;
+// unsigned long lastScheduleUpdate = 0;
+// unsigned long scheduleUpdateInterval = 3600000;
 
 int heartbeatFailCount = 0;
 int wifiFailCount = 0;
@@ -127,11 +110,10 @@ int wifiFailCount = 0;
 bool reprovisionMode = false;
 bool serverUnreachable = false;
 bool ledState = false;
-bool connectBlinkState = false;
 bool isConnecting = false;
-bool isInitialScheduleLoaded = false;
 bool sdMounted = false;
 bool localStorage = true;
+bool attendanceFolderReady = false;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -144,7 +126,6 @@ const int GRACE_LATE_IN = 15;
 const int GRACE_EARLY_OUT = 0;
 const int GRACE_LATE_OUT = 15;
 const int MIN_WORK_DURATION = 30;
-const int MAX_SHIFT_HOURS = 18;
 const int MIN_GAP_BETWEEN_RECORDS = 10;
 
 bool autoSyncEnabled = true;
@@ -157,11 +138,7 @@ std::vector<TodaysRecord> todaysCheckOuts;
 int currentProcessingDay = -1;
 
 // ================== DAILY LOG FILE ==================
-// const char* LOG_FILE = "/attendance_logs.csv";
 const char* DAILY_LOG_PREFIX = "/log_";
-
-// ================== MONTHLY LOG FILE ==================
-// #define MONTHLY_LOG_PREFIX "/monthly_"
 
 // ================== STRUCTURES ==================
 struct UserSchedule {
@@ -175,21 +152,8 @@ struct UserSchedule {
   String checkOutTo;
 };
 
-struct StoredData {
-  char lastUpdated[25];
-  int totalUsers;
-  unsigned long nextUpdateTime;
-};
-
-struct ApiResponse {
-  bool success;
-  String message;
-  String data;
-};
-
 // ================== GLOBAL VECTORS ==================
 std::vector<UserSchedule> userSchedules;
-StoredData storedData;
 
 // ================== OBJECTS ==================
 WiFiManager wifiManager;
@@ -212,7 +176,7 @@ bool sendAttendance(String cardUuid);
 void setRTCFromNTP();
 void fetchAndStoreSchedules();
 void saveScheduleToSD();
-bool loadScheduleFromSD();
+bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule& foundSchedule);
 void loadTodayRecordsFromSD();
 void cleanupOldDailyFiles();
 bool syncMonthlyRecordsToServer(int year, int month);
@@ -235,10 +199,9 @@ void resetTodayRecords();
 bool isNewDay(const DateTime& currentTime);
 void checkDayChange(const DateTime& currentTime);
 String getDayName(int dayOfWeek);
-String getNextScheduleInfo(int userId, int currentDOW);
+String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW);
 AttendanceResult processLocalAttendance(const String& cardUuid, int userId, const String& userName, const UserSchedule& todaySchedule, const DateTime& currentTime);
 bool saveAttendanceLogToSD(const String& cardUuid, int userId, const String& userName, const String& timestamp, const String& recordType, const String& status, const String& message, const String& dayOfWeek, const String& checkInWindow, const String& checkOutWindow);
-bool findUserSchedule(int userId, int dayOfWeek, UserSchedule*& foundSchedule);
 void blinkWhiteLED();
 void blinkGreenOnce();
 void blinkRedTwice();
@@ -301,17 +264,6 @@ DateTime getLocalTime() {
                 timezoneOffsetMinutes);
 
   return local;
-}
-
-// ================== FIND USER SCHEDULE ==================
-bool findUserSchedule(int userId, int dayOfWeek, UserSchedule*& foundSchedule) {
-  for (auto& schedule : userSchedules) {
-    if (schedule.userId == userId && schedule.dayOfWeek == dayOfWeek) {
-      foundSchedule = &schedule;
-      return true;
-    }
-  }
-  return false;
 }
 
 // ================== MQTT CONNECTION ==================
@@ -395,7 +347,7 @@ void publishHeartbeat() {
 
     if (rssi >= -50) {
       quality = "Excellent";
-      speed = 72;  // theoretical max for strong signal
+      speed = 72;
     } else if (rssi >= -60) {
       quality = "Good";
       speed = 54;
@@ -424,10 +376,13 @@ void publishHeartbeat() {
   doc["autoSyncEnabled"] = autoSyncEnabled;
   doc["timestamp"] = getLocalTime().unixtime();
 
+  doc["cpuFreqMHz"] = ESP.getCpuFreqMHz();
+  doc["freeHeapBytes"] = ESP.getFreeHeap();
+  doc["heapFragmentation"] = ESP.getHeapFragmentation();
+
   JsonObject sd = doc.createNestedObject("sd");
   sd["enabled"] = localStorage;
   sd["mounted"] = sdMounted;
-  sd["scheduleFileExists"] = (localStorage && sdMounted) ? SD.exists(SCHEDULE_FILE) : false;
 
   String payload;
   serializeJson(doc, payload);
@@ -889,7 +844,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       response = getMonthlyAttendanceRecords(year, month);
     }
 
-    Serial.println("DEBUG raw response: " + response);  // ← YEH MOST IMPORTANT HAI
+    Serial.println("DEBUG raw response: " + response);
 
     DynamicJsonDocument respDoc(2048);
     DeserializationError error = deserializeJson(respDoc, response);
@@ -1080,7 +1035,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
   }
 
   else if (command == "sync_user_schedule") {
-    // Get commandId from incoming message
     String commandId = doc["commandId"] | "";
 
     bool replaceAll = doc["replaceAll"] | false;
@@ -1113,31 +1067,17 @@ void handleMqttCommand(String command, JsonDocument& doc) {
         int dayOfWeek = sched["dayOfWeek"] | 0;
         if (dayOfWeek == 0) continue;
 
-        UserSchedule* existing = nullptr;
-        bool exists = findUserSchedule(userId, dayOfWeek, existing);
-
-        if (exists && !replaceAll) {
-          existing->cardUuid = cardUuid;
-          existing->userName = userName;
-          existing->checkInFrom = sched["checkInFrom"] | "";
-          existing->checkInTo = sched["checkInTo"] | "";
-          existing->checkOutFrom = sched["checkOutFrom"] | "";
-          existing->checkOutTo = sched["checkOutTo"] | "";
-          updatedCount++;
-        } else {
-          UserSchedule newSched;
-          newSched.userId = userId;
-          newSched.cardUuid = cardUuid;
-          newSched.userName = userName;
-          newSched.dayOfWeek = dayOfWeek;
-          newSched.checkInFrom = sched["checkInFrom"] | "";
-          newSched.checkInTo = sched["checkInTo"] | "";
-          newSched.checkOutFrom = sched["checkOutFrom"] | "";
-          newSched.checkOutTo = sched["checkOutTo"] | "";
-
-          userSchedules.push_back(newSched);
-          addedCount++;
-        }
+        UserSchedule newSched;
+        newSched.userId = userId;
+        newSched.cardUuid = cardUuid;
+        newSched.userName = userName;
+        newSched.dayOfWeek = dayOfWeek;
+        newSched.checkInFrom = sched["checkInFrom"] | "";
+        newSched.checkInTo = sched["checkInTo"] | "";
+        newSched.checkOutFrom = sched["checkOutFrom"] | "";
+        newSched.checkOutTo = sched["checkOutTo"] | "";
+        userSchedules.push_back(newSched);
+        addedCount++;
       }
     }
 
@@ -1177,60 +1117,107 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     DynamicJsonDocument data(8192);
     data["success"] = true;
     data["message"] = "Schedules fetched";
-
     JsonArray users = data.createNestedArray("users");
-
     int totalCount = 0;
 
-    if (targetCardUuid.length() > 0) {
-      // Sirf specific cardUuid ke schedules bhejo
-      Serial.println("Returning schedules only for cardUuid: " + targetCardUuid);
-
-      for (auto& u : userSchedules) {
-        if (u.cardUuid == targetCardUuid) {
-          JsonObject user = users.createNestedObject();
-          user["id"] = u.userId;
-          user["cardUuid"] = u.cardUuid;
-          user["name"] = u.userName;
-          user["dayOfWeek"] = u.dayOfWeek;
-          user["checkInFrom"] = u.checkInFrom;
-          user["checkInTo"] = u.checkInTo;
-          user["checkOutFrom"] = u.checkOutFrom;
-          user["checkOutTo"] = u.checkOutTo;
-          totalCount++;
-        }
-      }
+    if (!sdMounted) {
+      data["success"] = false;
+      data["message"] = "SD not mounted";
     } else {
-      // Saare users ke schedules bhejo (default behavior)
-      Serial.println("Returning ALL loaded schedules");
-
-      for (auto& u : userSchedules) {
-        JsonObject user = users.createNestedObject();
-        user["id"] = u.userId;
-        user["cardUuid"] = u.cardUuid;
-        user["name"] = u.userName;
-        user["dayOfWeek"] = u.dayOfWeek;
-        user["checkInFrom"] = u.checkInFrom;
-        user["checkInTo"] = u.checkInTo;
-        user["checkOutFrom"] = u.checkOutFrom;
-        user["checkOutTo"] = u.checkOutTo;
-        totalCount++;
+      // SD se schedules folder open karo
+      if (targetCardUuid.length() > 0) {
+        // Sirf ek user ki file
+        String filePath = String(SCHEDULES_FOLDER) + targetCardUuid + ".csv";
+        if (SD.exists(filePath.c_str())) {
+          File file = SD.open(filePath.c_str(), FILE_READ);
+          if (file) {
+            file.readStringUntil('\n');  // header skip
+            while (file.available()) {
+              String line = file.readStringUntil('\n');
+              line.trim();
+              if (line.length() == 0) continue;
+              int p1 = line.indexOf(',');
+              int p2 = line.indexOf(',', p1 + 1);
+              int p3 = line.indexOf(',', p2 + 1);
+              int p4 = line.indexOf(',', p3 + 1);
+              int p5 = line.indexOf(',', p4 + 1);
+              int p6 = line.indexOf(',', p5 + 1);
+              if (p6 == -1) continue;
+              JsonObject user = users.createNestedObject();
+              user["id"] = line.substring(0, p1).toInt();
+              user["cardUuid"] = targetCardUuid;
+              user["name"] = line.substring(p1 + 1, p2);
+              user["dayOfWeek"] = line.substring(p2 + 1, p3).toInt();
+              user["checkInFrom"] = line.substring(p3 + 1, p4);
+              user["checkInTo"] = line.substring(p4 + 1, p5);
+              user["checkOutFrom"] = line.substring(p5 + 1, p6);
+              user["checkOutTo"] = line.substring(p6 + 1);
+              totalCount++;
+            }
+            file.close();
+          }
+        }
+      } else {
+        // Saari files /schedules/ folder se
+        File dir = SD.open(SCHEDULES_FOLDER);
+        if (dir) {
+          while (true) {
+            File entry = dir.openNextFile();
+            if (!entry) break;
+            if (entry.isDirectory()) {
+              entry.close();
+              continue;
+            }
+            String fullName = String(entry.name());
+            int lastSlash = fullName.lastIndexOf('/');
+            String fileName = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
+            if (!fileName.endsWith(".csv")) {
+              entry.close();
+              continue;
+            }
+            String uuid = fileName.substring(0, fileName.length() - 4);
+            String filePath = String(SCHEDULES_FOLDER) + fileName;
+            entry.close();
+            File file = SD.open(filePath.c_str(), FILE_READ);
+            if (!file) continue;
+            file.readStringUntil('\n');
+            while (file.available()) {
+              String line = file.readStringUntil('\n');
+              line.trim();
+              if (line.length() == 0) continue;
+              int p1 = line.indexOf(',');
+              int p2 = line.indexOf(',', p1 + 1);
+              int p3 = line.indexOf(',', p2 + 1);
+              int p4 = line.indexOf(',', p3 + 1);
+              int p5 = line.indexOf(',', p4 + 1);
+              int p6 = line.indexOf(',', p5 + 1);
+              if (p6 == -1) continue;
+              JsonObject user = users.createNestedObject();
+              user["id"] = line.substring(0, p1).toInt();
+              user["cardUuid"] = uuid;
+              user["name"] = line.substring(p1 + 1, p2);
+              user["dayOfWeek"] = line.substring(p2 + 1, p3).toInt();
+              user["checkInFrom"] = line.substring(p3 + 1, p4);
+              user["checkInTo"] = line.substring(p4 + 1, p5);
+              user["checkOutFrom"] = line.substring(p5 + 1, p6);
+              user["checkOutTo"] = line.substring(p6 + 1);
+              totalCount++;
+            }
+            file.close();
+          }
+          dir.close();
+        }
       }
     }
 
     data["totalUsers"] = totalCount;
     data["filteredByCardUuid"] = (targetCardUuid.length() > 0) ? targetCardUuid : "all";
-
-    if (commandId.length() > 0) {
-      data["commandId"] = commandId;
-    }
+    if (commandId.length() > 0) data["commandId"] = commandId;
 
     String dataPayload;
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
-
-    Serial.printf("Sent %d schedules in response (commandId: %s)\n",
-                  totalCount, commandId.c_str());
+    Serial.printf("Sent %d schedules from SD (commandId: %s)\n", totalCount, commandId.c_str());
   }
 
   else if (command == "restart") {
@@ -1298,56 +1285,6 @@ void fetchAndStoreSchedules() {
         blinkRedTwice();
         http.end();
         return;
-      }
-
-      String newHash = data["lastUpdated"] | "";
-      String oldHash = String(storedData.lastUpdated);
-      bool dataChanged = (newHash != oldHash);
-
-      if (dataChanged) {
-        userSchedules.clear();
-
-        JsonArray users = data["users"];
-        int scheduleCount = 0;
-
-        for (JsonObject user : users) {
-          String cardUuid = user["cardUuid"] | "";
-          String userName = user["name"] | "";
-          int userId = user["id"] | 0;
-
-          if (cardUuid != "null" && cardUuid.length() > 0) {
-            JsonArray schedules = user["schedules"];
-
-            for (JsonObject schedule : schedules) {
-              UserSchedule userSchedule;
-              userSchedule.userId = userId;
-              userSchedule.cardUuid = cardUuid;
-              userSchedule.userName = userName;
-              userSchedule.dayOfWeek = schedule["day"] | 0;
-              userSchedule.checkInFrom = schedule["checkInFrom"] | "";
-              userSchedule.checkInTo = schedule["checkInTo"] | "";
-              userSchedule.checkOutFrom = schedule["checkOutFrom"] | "";
-              userSchedule.checkOutTo = schedule["checkOutTo"] | "";
-
-              userSchedules.push_back(userSchedule);
-              scheduleCount++;
-            }
-          }
-        }
-
-        if (localStorage && sdMounted) {
-          saveScheduleToSD();
-        }
-
-        publishMqttStatus("schedule_updated", "Schedules updated: " + String(scheduleCount));
-
-        int blinkCount = min(scheduleCount, 5);
-        for (int i = 0; i < blinkCount; i++) {
-          blinkGreenOnce();
-          delay(150);
-        }
-      } else {
-        blinkGreenOnce();
       }
 
       serverUnreachable = false;
@@ -1466,57 +1403,32 @@ void handleRFID() {
   Serial.println("Card scanned: " + cardUuid);
 
   if (localStorage) {
-    if (userSchedules.size() == 0) {
-      Serial.println("No schedules loaded");
-      blinkRedTwice();
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
-      delay(1200);
-      return;
-    }
-
     DateTime currentTime = getLocalTime();
     int currentDOW = currentTime.dayOfTheWeek();
     currentDOW = (currentDOW == 0) ? 7 : currentDOW;
 
-    // ✅ OPTIMIZED: Single loop - card exist + today schedule dono check
-    const UserSchedule* todaysSchedule = nullptr;
-    bool foundInSchedule = false;
-
-    for (const auto& schedule : userSchedules) {
-      if (schedule.cardUuid == cardUuid) {
-        foundInSchedule = true;
-        if (schedule.dayOfWeek == currentDOW) {
-          todaysSchedule = &schedule;
-          break;
-        }
-      }
-    }
-
-    if (!foundInSchedule) {
-      Serial.println("Card not found in local schedule");
+    UserSchedule todayScheduleObj;
+    if (!loadUserScheduleFromSD(cardUuid, currentDOW, todayScheduleObj)) {
+      Serial.println("❌ Card not found or no schedule for today");
       blinkRedTwice();
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
       delay(1200);
       return;
     }
+    const UserSchedule* todaysSchedule = &todayScheduleObj;
 
-    if (!todaysSchedule) {
-      Serial.println("❌ No schedule for today");
-      blinkRedTwice();
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
-      delay(1200);
-      return;
-    }
+    std::vector<TodaysRecord> userCheckIns, userCheckOuts;
+    getUserTodayRecords(cardUuid, userCheckIns, userCheckOuts);
 
     AttendanceResult localResult = processLocalAttendance(
       cardUuid,
       todaysSchedule->userId,
       todaysSchedule->userName,
       *todaysSchedule,
-      currentTime);
+      currentTime,
+      userCheckIns,
+      userCheckOuts);
 
     if (localResult.success) {
       blinkGreenOnce();
@@ -1787,20 +1699,121 @@ String getDayName(int dayOfWeek) {
   }
 }
 
-String getNextScheduleInfo(int userId, int currentDOW) {
+String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW) {
+  if (!sdMounted) return "No upcoming schedule";
+
+  String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+  if (!SD.exists(filePath.c_str())) return "No upcoming schedule";
+
+  File file = SD.open(filePath.c_str(), FILE_READ);
+  if (!file) return "No upcoming schedule";
+
+  file.readStringUntil('\n');
+
+  // Saare schedules padho aur next day dhundo
+  std::vector<int> availableDays;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int p1 = line.indexOf(',');
+    int p2 = line.indexOf(',', p1 + 1);
+    int p3 = line.indexOf(',', p2 + 1);
+    if (p3 == -1) continue;
+
+    int dow = line.substring(p2 + 1, p3).toInt();
+    availableDays.push_back(dow);
+  }
+  file.close();
+
+  // Next schedule dhundo
   for (int i = 1; i <= 7; i++) {
     int checkDay = currentDOW + i;
     if (checkDay > 7) checkDay -= 7;
 
-    for (const auto& schedule : userSchedules) {
-      if (schedule.userId == userId && schedule.dayOfWeek == checkDay) {
-        String dayName = getDayName(checkDay);
-        String checkInTime = formatTimeDisplay(schedule.checkInFrom);
-        return dayName + " at " + checkInTime;
+    for (int d : availableDays) {
+      if (d == checkDay) {
+        return getDayName(checkDay);
       }
     }
   }
+
   return "No upcoming schedule";
+}
+
+bool getUserTodayRecords(const String& cardUuid,
+                         std::vector<TodaysRecord>& checkIns,
+                         std::vector<TodaysRecord>& checkOuts) {
+  checkIns.clear();
+  checkOuts.clear();
+
+  DateTime now = getLocalTime();
+  char filename[32];
+  sprintf(filename, "%s%04d%02d%02d.csv",
+          DAILY_LOG_PREFIX, now.year(), now.month(), now.day());
+
+  if (!SD.exists(filename)) return true;
+
+  File file = SD.open(filename, FILE_READ);
+  if (!file) return false;
+
+  file.readStringUntil('\n');  // header skip
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // Sirf is card ka record check karo
+    if (line.indexOf(cardUuid) < 0) continue;
+
+    // Parse karo
+    int p0 = line.indexOf(',');
+    int p1 = line.indexOf(',', p0 + 1);
+    int p4 = line.indexOf(',', p1 + 1);
+    int p5 = line.indexOf(',', p4 + 1);
+    for (int i = 0; i < 2; i++) p4 = line.indexOf(',', p4 + 1);
+
+    String timestamp = line.substring(0, p0);
+    String recordType = line.substring(line.lastIndexOf(',',
+                                                        line.indexOf(',', p1 + 1) + 1)
+                                       + 1);
+
+    // Simple parse
+    int commaCount = 0;
+    int sp = 0;
+    String fields[10];
+    while (sp < line.length()) {
+      int cp = line.indexOf(',', sp);
+      if (cp == -1) cp = line.length();
+      fields[commaCount++] = line.substring(sp, cp);
+      sp = cp + 1;
+      if (commaCount >= 10) break;
+    }
+
+    if (commaCount < 5) continue;
+
+    TodaysRecord record;
+    record.recordType = fields[4];  // type field
+
+    int timeStart = fields[0].indexOf(' ') + 1;
+    String timeStr = fields[0].substring(timeStart);
+    int h = timeStr.substring(0, 2).toInt();
+    int m = timeStr.substring(3, 5).toInt();
+    int s = timeStr.substring(6, 8).toInt();
+    record.timestamp = h * 3600 + m * 60 + s;
+    record.timestampStr = timeStr;
+
+    if (record.recordType == "in") {
+      checkIns.push_back(record);
+    } else if (record.recordType == "out") {
+      checkOuts.push_back(record);
+    }
+  }
+
+  file.close();
+  return true;
 }
 
 AttendanceResult processLocalAttendance(
@@ -1808,7 +1821,9 @@ AttendanceResult processLocalAttendance(
   int userId,
   const String& userName,
   const UserSchedule& todaySchedule,
-  const DateTime& currentTime) {
+  const DateTime& currentTime,
+  const std::vector<TodaysRecord>& checkIns,
+  const std::vector<TodaysRecord>& checkOuts) {
 
   AttendanceResult result;
   result.success = false;
@@ -1847,15 +1862,16 @@ AttendanceResult processLocalAttendance(
   bool isBeforeCheckOutWindow = currentTimeSec < earliestCheckOut;
   bool isAfterCheckOutWindow = currentTimeSec > latestCheckOut;
 
-  bool hasOpenCheckIn = (todaysCheckIns.size() > todaysCheckOuts.size());
+  // bool hasOpenCheckIn = (todaysCheckIns.size() > todaysCheckOuts.size());
+  bool hasOpenCheckIn = (checkIns.size() > checkOuts.size());
 
-  if (todaysCheckIns.size() > 0 || todaysCheckOuts.size() > 0) {
+  if (checkIns.size() > 0 || checkOuts.size() > 0) {
     int lastRecordTime = 0;
-    if (todaysCheckOuts.size() > 0) {
-      lastRecordTime = todaysCheckOuts.back().timestamp;
+    if (checkOuts.size() > 0) {
+      lastRecordTime = checkOuts.back().timestamp;
     }
-    if (todaysCheckIns.size() > 0) {
-      int lastInTime = todaysCheckIns.back().timestamp;
+    if (checkIns.size() > 0) {
+      int lastInTime = checkIns.back().timestamp;
       if (lastInTime > lastRecordTime) lastRecordTime = lastInTime;
     }
 
@@ -1867,7 +1883,7 @@ AttendanceResult processLocalAttendance(
   }
 
   // CASE 1: USER HASN'T CHECKED IN TODAY
-  if (todaysCheckIns.size() == 0) {
+  if (checkIns.size() == 0) {
     if (isBeforeCheckInWindow) {
       String checkInTime = addMinutesToTimeStr(todaySchedule.checkInFrom, -GRACE_EARLY_IN);
       result.message = "Shift hasn't started yet. Check-in window opens at " + checkInTime;
@@ -1916,8 +1932,8 @@ AttendanceResult processLocalAttendance(
       result.message = "Checked out late";
     }
 
-    if (todaysCheckOuts.size() == 0 && todaysCheckIns.size() > 0) {
-      TodaysRecord& lastCheckInRecord = todaysCheckIns.back();
+    if (checkOuts.size() == 0 && checkIns.size() > 0) {
+      const TodaysRecord& lastCheckInRecord = checkIns.back();
       int minutesWorked = (currentTimeSec - lastCheckInRecord.timestamp) / 60;
 
       if (minutesWorked < MIN_WORK_DURATION) {
@@ -1932,20 +1948,20 @@ AttendanceResult processLocalAttendance(
 
   // CASE 3: CHECK-OUT WINDOW IS CLOSED - HANDLE MISSED CHECK-OUTS
   else if (isAfterCheckOutWindow) {
-    if (todaysCheckIns.size() > 0 && todaysCheckOuts.size() == 0) {
+    if (checkIns.size() > 0 && checkOuts.size() == 0) {
       // User checked in but didn't check out
       String checkInTime = formatTimeDisplay(todaySchedule.checkInFrom);
       String lateCheckOutEnd = addMinutesToTimeStr(todaySchedule.checkOutTo, GRACE_LATE_OUT);
-      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
+      String nextSchedule = getNextScheduleInfo(userId, cardUuid, currentDOW);
 
       result.message = "⚠️ Today's shift ended without check-out!\n   ✓ Check-in: " + checkInTime + "\n   ⛔ Check-out window closed: " + lateCheckOutEnd + "\n   📅 Next shift: " + nextSchedule;
       result.recordType = "in";
       return result;
-    } else if (todaysCheckIns.size() == 0) {
+    } else if (checkIns.size() == 0) {
       // User never checked in
       String checkInStartTime = formatTimeDisplay(todaySchedule.checkInFrom);
       String lateCheckInEnd = addMinutesToTimeStr(todaySchedule.checkInTo, GRACE_LATE_IN);
-      String nextSchedule = getNextScheduleInfo(userId, currentDOW);
+      String nextSchedule = getNextScheduleInfo(userId, cardUuid, currentDOW);
 
       result.message = "❌ You missed today's shift!\n   ✓ Check-in window was: " + checkInStartTime + " - " + lateCheckInEnd + "\n   📅 Next shift: " + nextSchedule;
       result.recordType = "in";
@@ -1979,6 +1995,19 @@ AttendanceResult processLocalAttendance(
   result.formattedTime = formatTimeDisplay(secondsToTimeStr(currentTimeSec));
 
   return result;
+}
+
+String lastCreatedMonthFolder = "";
+
+void ensureAttendanceFolders(const char* monthFolder) {
+  if (!attendanceFolderReady) {
+    if (!SD.exists("/attendance")) SD.mkdir("/attendance");
+    attendanceFolderReady = true;
+  }
+  if (String(monthFolder) != lastCreatedMonthFolder) {
+    if (!SD.exists(monthFolder)) SD.mkdir(monthFolder);
+    lastCreatedMonthFolder = String(monthFolder);
+  }
 }
 
 // ================== SAVE TO SD FUNCTIONS ==================
@@ -2030,33 +2059,7 @@ bool saveAttendanceLogToSD(
   char monthFolder[32];
   sprintf(monthFolder, "/attendance/%04d-%02d", now.year(), now.month());
 
-  // Debug: Root folder check
-  if (!SD.exists("/attendance")) {
-    Serial.println("Root /attendance does not exist. Trying to create...");
-    if (SD.mkdir("/attendance")) {
-      Serial.println("Successfully created root /attendance folder");
-    } else {
-      Serial.println("CRITICAL: Failed to create root /attendance folder! Continuing anyway...");
-      // Abhi skip kar ke month folder direct try karenge
-    }
-  } else {
-    Serial.println("Root /attendance already exists");
-  }
-
-  // Month folder check & create
-  Serial.println("Checking month folder: " + String(monthFolder));
-  if (!SD.exists(monthFolder)) {
-    Serial.println("Month folder does not exist. Creating...");
-    if (SD.mkdir(monthFolder)) {
-      Serial.println("Successfully created month folder: " + String(monthFolder));
-    } else {
-      Serial.println("Failed to create month folder: " + String(monthFolder));
-      // Agar fail ho to monthly save skip karo, lekin daily to chalta rahe
-      return true;  // Daily to save ho gaya, return true
-    }
-  } else {
-    Serial.println("Month folder already exists");
-  }
+  ensureAttendanceFolders(monthFolder);
 
   // User file
   String userFilePath = String(monthFolder) + "/" + cardUuid + ".csv";
@@ -2169,100 +2172,57 @@ void saveScheduleToSD() {
   Serial.println("✅ All user schedules saved as separate CSV files");
 }
 
-bool loadScheduleFromSD() {
-  Serial.println("📂 === LOADING SCHEDULES FROM /schedules/ FOLDER ===");
+bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule& foundSchedule) {
+  if (!sdMounted) return false;
 
-  if (!sdMounted) {
-    Serial.println("SD not mounted");
+  String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+
+  if (!SD.exists(filePath.c_str())) {
+    Serial.println("❌ No schedule file for card: " + cardUuid);
     return false;
   }
 
-  if (!SD.exists(SCHEDULES_FOLDER)) {
-    Serial.println("⚠️ No schedules folder found");
-    return false;
+  File file = SD.open(filePath.c_str(), FILE_READ);
+  if (!file) return false;
+
+  // Header skip
+  file.readStringUntil('\n');
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // Parse: userId,userName,dayOfWeek,checkInFrom,checkInTo,checkOutFrom,checkOutTo
+    int p1 = line.indexOf(',');
+    int p2 = line.indexOf(',', p1 + 1);
+    int p3 = line.indexOf(',', p2 + 1);
+    int p4 = line.indexOf(',', p3 + 1);
+    int p5 = line.indexOf(',', p4 + 1);
+    int p6 = line.indexOf(',', p5 + 1);
+
+    if (p6 == -1) continue;
+
+    int fileDOW = line.substring(p2 + 1, p3).toInt();
+
+    // Sirf aaj ka day match karo
+    if (fileDOW != dayOfWeek) continue;
+
+    foundSchedule.cardUuid = cardUuid;
+    foundSchedule.userId = line.substring(0, p1).toInt();
+    foundSchedule.userName = line.substring(p1 + 1, p2);
+    foundSchedule.dayOfWeek = fileDOW;
+    foundSchedule.checkInFrom = line.substring(p3 + 1, p4);
+    foundSchedule.checkInTo = line.substring(p4 + 1, p5);
+    foundSchedule.checkOutFrom = line.substring(p5 + 1, p6);
+    foundSchedule.checkOutTo = line.substring(p6 + 1);
+
+    file.close();
+    return true;
   }
 
-  userSchedules.clear();
-
-  File dir = SD.open(SCHEDULES_FOLDER);
-  if (!dir) {
-    Serial.println("❌ Failed to open schedules folder");
-    return false;
-  }
-
-  int totalSchedules = 0;
-  int totalUsers = 0;
-
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) break;
-
-    if (entry.isDirectory()) {
-      entry.close();
-      continue;
-    }
-
-    String fileName = entry.name();
-    if (!fileName.endsWith(".csv")) {
-      entry.close();
-      continue;
-    }
-
-    // cardUuid nikaalo (filename se .csv hata ke)
-    String cardUuid = fileName.substring(0, fileName.length() - 4);
-
-    File csvFile = SD.open(String(SCHEDULES_FOLDER) + fileName, FILE_READ);
-    if (!csvFile) {
-      Serial.println("Failed to open: " + fileName);
-      entry.close();
-      continue;
-    }
-
-    // Header skip
-    csvFile.readStringUntil('\n');
-
-    while (csvFile.available()) {
-      String line = csvFile.readStringUntil('\n');
-      line.trim();
-      if (line.length() == 0) continue;
-
-      // CSV parse (simple comma split)
-      int pos1 = line.indexOf(',');
-      int pos2 = line.indexOf(',', pos1 + 1);
-      int pos3 = line.indexOf(',', pos2 + 1);
-      int pos4 = line.indexOf(',', pos3 + 1);
-      int pos5 = line.indexOf(',', pos4 + 1);
-      int pos6 = line.indexOf(',', pos5 + 1);
-
-      if (pos6 == -1) continue;  // invalid line
-
-      UserSchedule s;
-      s.cardUuid = cardUuid;
-      s.userId = line.substring(0, pos1).toInt();
-      s.userName = line.substring(pos1 + 1, pos2);
-      s.dayOfWeek = line.substring(pos2 + 1, pos3).toInt();
-      s.checkInFrom = line.substring(pos3 + 1, pos4);
-      s.checkInTo = line.substring(pos4 + 1, pos5);
-      s.checkOutFrom = line.substring(pos5 + 1, pos6);
-      s.checkOutTo = line.substring(pos6 + 1);
-
-      userSchedules.push_back(s);
-      totalSchedules++;
-    }
-
-    csvFile.close();
-    entry.close();
-
-    totalUsers++;
-    Serial.printf("Loaded %d schedules from %s\n", totalSchedules, fileName.c_str());
-  }
-
-  dir.close();
-
-  Serial.printf("✅ Loaded total %d schedules for %d users from SD\n",
-                totalSchedules, totalUsers);
-
-  return totalSchedules > 0;
+  file.close();
+  return false;
 }
 
 void loadTodayRecordsFromSD() {
@@ -3354,17 +3314,6 @@ void setup() {
   } else {
     Serial.println("✅ SD Card initialized");
     sdMounted = true;
-
-    if (localStorage) {
-      Serial.println("Local storage enabled — loading schedule");
-
-      if (loadScheduleFromSD()) {
-        Serial.println("📅 Schedule loaded from SD");
-        isInitialScheduleLoaded = true;
-      } else {
-        Serial.println("⚠️ No schedule found on SD");
-      }
-    }
   }
 
   Wire.begin(D1, D2);
@@ -3421,8 +3370,7 @@ void setup() {
 
   reprovisionMode = false;
   lastHeartbeatTime = millis();
-  lastScanTime = millis();
-  lastScheduleUpdate = millis();
+  // lastScheduleUpdate = millis();
 
   if (localStorage) {
     todaysCheckIns.clear();
