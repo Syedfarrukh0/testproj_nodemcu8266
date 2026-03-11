@@ -39,7 +39,7 @@ PCF8574 pcf(PCF_ADDRESS);
 
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
-#define SCHEDULES_FOLDER "/schedules/"
+#define SCHEDULES_FOLDER "/schedules"
 #define ATTENDANCE_FOLDER "/attendance/"
 
 // ================== LED PINS on PCF8574 ==================
@@ -1127,7 +1127,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       // SD se schedules folder open karo
       if (targetCardUuid.length() > 0) {
         // Sirf ek user ki file
-        String filePath = String(SCHEDULES_FOLDER) + targetCardUuid + ".csv";
+        String filePath = String(SCHEDULES_FOLDER) + "/" + targetCardUuid + ".csv";
         if (SD.exists(filePath.c_str())) {
           File file = SD.open(filePath.c_str(), FILE_READ);
           if (file) {
@@ -1176,7 +1176,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
               continue;
             }
             String uuid = fileName.substring(0, fileName.length() - 4);
-            String filePath = String(SCHEDULES_FOLDER) + fileName;
+            String filePath = String(SCHEDULES_FOLDER) + "/" + fileName;
             entry.close();
             File file = SD.open(filePath.c_str(), FILE_READ);
             if (!file) continue;
@@ -2112,11 +2112,28 @@ void saveScheduleToSD() {
   }
 
   // Folder banao
+  // if (!SD.exists(SCHEDULES_FOLDER)) {
+  //   if (SD.mkdir(SCHEDULES_FOLDER)) {
+  //     Serial.println("📁 Created schedules folder: " + String(SCHEDULES_FOLDER));
+  //   } else {
+  //     Serial.println("❌ Failed to create schedules folder!");
+  //     return;
+  //   }
+  // }
+
   if (!SD.exists(SCHEDULES_FOLDER)) {
-    if (SD.mkdir(SCHEDULES_FOLDER)) {
-      Serial.println("📁 Created schedules folder: " + String(SCHEDULES_FOLDER));
-    } else {
-      Serial.println("❌ Failed to create schedules folder!");
+    bool folderCreated = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      if (SD.mkdir(SCHEDULES_FOLDER)) {
+        folderCreated = true;
+        Serial.println("📁 Created schedules folder: " + String(SCHEDULES_FOLDER));
+        break;
+      }
+      Serial.printf("⚠️ mkdir attempt %d failed, retrying...\n", attempt);
+      delay(100);
+    }
+    if (!folderCreated) {
+      Serial.println("❌ Failed to create schedules folder after 3 attempts!");
       return;
     }
   }
@@ -2140,7 +2157,7 @@ void saveScheduleToSD() {
 
   // Har unique UUID ke liye file banao
   for (auto& cardUuid : uniqueUuids) {
-    String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+    String filePath = String(SCHEDULES_FOLDER) + "/" + cardUuid + ".csv";
 
     // Purani file delete
     if (SD.exists(filePath.c_str())) {
@@ -2175,7 +2192,7 @@ void saveScheduleToSD() {
 bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule& foundSchedule) {
   if (!sdMounted) return false;
 
-  String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+  String filePath = String(SCHEDULES_FOLDER) + "/" + cardUuid + ".csv";
 
   if (!SD.exists(filePath.c_str())) {
     Serial.println("❌ No schedule file for card: " + cardUuid);
@@ -3314,6 +3331,17 @@ void setup() {
   } else {
     Serial.println("✅ SD Card initialized");
     sdMounted = true;
+
+    // YE ADD KARO — startup pe hi folders bana do
+    if (!SD.exists("/schedules")) {
+      SD.mkdir("/schedules");
+      Serial.println("📁 /schedules folder created");
+    }
+    if (!SD.exists("/attendance")) {
+      SD.mkdir("/attendance");
+      attendanceFolderReady = true;
+      Serial.println("📁 /attendance folder created");
+    }
   }
 
   Wire.begin(D1, D2);
