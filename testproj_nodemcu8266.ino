@@ -37,6 +37,8 @@ PCF8574 pcf(PCF_ADDRESS);
 #define EEPROM_SERVER_URL_ADDR 200
 #define EEPROM_SERVER_URL_LEN 100
 
+#define SD_OPERATION_TIMEOUT 10000
+
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
 #define SCHEDULES_FOLDER "/schedules"
@@ -47,6 +49,8 @@ PCF8574 pcf(PCF_ADDRESS);
 #define BLUE_LED_PIN 1
 #define GREEN_LED_PIN 2
 #define RED_LED_PIN 3
+#define YELLOW_LED_PIN 4
+#define BUZZER_PIN 5
 
 // ================== RFID PINS ==================
 #define RST_PIN D3
@@ -101,12 +105,16 @@ int timezoneOffsetMinutes = 0;
 // ================== GLOBAL VARIABLES ==================
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastLedToggle = 0;
+unsigned long lastSDOperationTime = 0;
+unsigned long lastYellowBlink = 0;
+
 // unsigned long lastScheduleUpdate = 0;
 // unsigned long scheduleUpdateInterval = 3600000;
 
 int heartbeatFailCount = 0;
 int wifiFailCount = 0;
 
+bool yellowState = false;
 bool reprovisionMode = false;
 bool serverUnreachable = false;
 bool ledState = false;
@@ -502,7 +510,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
 
     Serial.println("🌐 Server URL changed to: " + SERVER_URL);
-
+    SD.end();
     delay(1000);
     ESP.restart();
   }
@@ -618,6 +626,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       }
       EEPROM.write(addr + 21, 0);  // Null terminator
       EEPROM.commit();
+      SD.end();
+      delay(500);
       ESP.restart();
     }
   }
@@ -655,6 +665,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       serializeJson(data, dataPayload);
       mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
 
+      SD.end();
       delay(1000);
       ESP.restart();
     } else {
@@ -1232,6 +1243,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     serializeJson(data, dataPayload);
     mqttClient.publish(MQTT_TOPIC_RESPONSE, dataPayload.c_str());
 
+    SD.end();
     delay(1000);
     ESP.restart();
   }
@@ -2192,15 +2204,22 @@ void saveScheduleToSD() {
 bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule& foundSchedule) {
   if (!sdMounted) return false;
 
+  markSDOperationStart();
+
   String filePath = String(SCHEDULES_FOLDER) + "/" + cardUuid + ".csv";
 
   if (!SD.exists(filePath.c_str())) {
     Serial.println("❌ No schedule file for card: " + cardUuid);
+    markSDOperationEnd();
     return false;
   }
 
   File file = SD.open(filePath.c_str(), FILE_READ);
-  if (!file) return false;
+  // if (!file) return false;
+  if (!file) {
+    markSDOperationEnd();
+    return false;
+  }
 
   // Header skip
   file.readStringUntil('\n');
@@ -2235,10 +2254,12 @@ bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule&
     foundSchedule.checkOutTo = line.substring(p6 + 1);
 
     file.close();
+    markSDOperationEnd();
     return true;
   }
 
   file.close();
+  markSDOperationEnd();
   return false;
 }
 
@@ -3248,6 +3269,49 @@ void checkPendingWifiFailure() {
   }
 }
 
+// =================== check sd init ========================
+bool initSDCard() {
+  // SD ko settle hone do
+  delay(500);
+
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    Serial.printf("SD init attempt %d/5...\n", attempt);
+
+    // Pehle end karo agar pehle se initialized tha
+    SD.end();
+    delay(200);
+
+    if (SD.begin(SD_CS_PIN)) {
+      Serial.println("✅ SD initialized successfully");
+      return true;
+    }
+
+    Serial.printf("❌ SD init failed, retry in %dms\n", attempt * 500);
+    delay(attempt * 500);  // Progressive delay: 500, 1000, 1500...
+  }
+
+  Serial.println("💀 SD init failed after 5 attempts");
+  return false;
+}
+
+// =============== check sd progress =================
+void markSDOperationStart() {
+  lastSDOperationTime = millis();
+}
+
+void markSDOperationEnd() {
+  lastSDOperationTime = 0;
+}
+
+void checkSDWatchdog() {
+  if (lastSDOperationTime > 0 && millis() - lastSDOperationTime > SD_OPERATION_TIMEOUT) {
+    Serial.println("⚠️ SD operation timeout detected! Restarting...");
+    SD.end();
+    delay(100);
+    ESP.restart();
+  }
+}
+
 // ================== LED FUNCTIONS ==================
 void blinkWhiteLED() {
   if (millis() - lastLedToggle >= 300) {
@@ -3259,16 +3323,28 @@ void blinkWhiteLED() {
 
 void blinkGreenOnce() {
   pcf.write(GREEN_LED_PIN, HIGH);
+  pcf.write(BUZZER_PIN, HIGH);
   delay(120);
   pcf.write(GREEN_LED_PIN, LOW);
+  pcf.write(BUZZER_PIN, LOW);
 }
 
 void blinkRedTwice() {
   for (int i = 0; i < 2; i++) {
     pcf.write(RED_LED_PIN, HIGH);
+    pcf.write(BUZZER_PIN, HIGH);
     delay(120);
     pcf.write(RED_LED_PIN, LOW);
+    pcf.write(BUZZER_PIN, LOW);
     delay(120);
+  }
+}
+
+void blinkYellowHeartbeat() {
+  if (millis() - lastYellowBlink >= 1000) {
+    lastYellowBlink = millis();
+    yellowState = !yellowState;
+    pcf.write(YELLOW_LED_PIN, yellowState ? HIGH : LOW);
   }
 }
 
@@ -3276,6 +3352,16 @@ void blinkRedTwice() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  Wire.begin(D1, D2);
+  pcf.begin();
+
+  pcf.write(WHITE_LED_PIN, LOW);
+  pcf.write(BLUE_LED_PIN, LOW);
+  pcf.write(GREEN_LED_PIN, LOW);
+  pcf.write(RED_LED_PIN, LOW);
+  pcf.write(YELLOW_LED_PIN, LOW);
+  pcf.write(BUZZER_PIN, LOW);
 
   Serial.println("\n\n=== ESP8266 Attendance Device Starting (MQTT Version) ===");
 
@@ -3325,32 +3411,14 @@ void setup() {
 
   SPI.begin();
 
-  if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("❌ SD Card init failed");
-    sdMounted = false;
-  } else {
-    Serial.println("✅ SD Card initialized");
-    sdMounted = true;
-
-    // YE ADD KARO — startup pe hi folders bana do
-    if (!SD.exists("/schedules")) {
-      SD.mkdir("/schedules");
-      Serial.println("📁 /schedules folder created");
-    }
+  sdMounted = initSDCard();
+  if (sdMounted) {
+    if (!SD.exists("/schedules")) SD.mkdir("/schedules");
     if (!SD.exists("/attendance")) {
       SD.mkdir("/attendance");
       attendanceFolderReady = true;
-      Serial.println("📁 /attendance folder created");
     }
   }
-
-  Wire.begin(D1, D2);
-  pcf.begin();
-
-  pcf.write(WHITE_LED_PIN, LOW);
-  pcf.write(BLUE_LED_PIN, LOW);
-  pcf.write(GREEN_LED_PIN, LOW);
-  pcf.write(RED_LED_PIN, LOW);
 
   if (!rtc.begin()) {
     Serial.println("❌ RTC not found");
@@ -3416,6 +3484,9 @@ void setup() {
 
 // ================== LOOP ==================
 void loop() {
+  checkSDWatchdog();
+  blinkYellowHeartbeat();
+
   wifiManager.process();
   static bool rtcSynced = false;
   unsigned long currentMillis = millis();
