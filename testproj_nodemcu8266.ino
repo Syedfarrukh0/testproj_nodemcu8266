@@ -57,7 +57,7 @@ PCF8574 pcf(PCF_ADDRESS);
 #define SS_PIN D4
 
 // ================== TESTING CONFIG ==================
-#define USE_NTP_TIME false
+#define USE_NTP_TIME true
 
 // ================== MANUAL TIME FOR TESTING ==================
 int manualYear = 2026;
@@ -1380,6 +1380,10 @@ void checkServerUnreachable() {
 void sendHeartbeat() {
   HTTPClient http;
   WiFiClient client;
+
+  client.setTimeout(5000);
+  http.setTimeout(5000);
+
   http.begin(client, String(SERVER_URL) + "/api/v1/device/heartbeat");
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", DEVICE_UUID);
@@ -2407,6 +2411,8 @@ bool syncMonthlyRecordsToServer(int year, int month) {
   if (isSyncing) return false;
   isSyncing = true;
 
+  markSDOperationStart();
+
   char monthFolder[32];
   sprintf(monthFolder, ATTENDANCE_FOLDER "%04d-%02d/", year, month);
 
@@ -2555,11 +2561,10 @@ bool syncMonthlyRecordsToServer(int year, int month) {
   }
 
   dir.close();
-
   Serial.printf("Monthly sync complete for %04d-%02d: Total synced %d, failed %d\n",
                 year, month, totalSynced, totalFailed);
+  markSDOperationEnd();
   isSyncing = false;
-
   return totalSynced > 0;
 }
 
@@ -2579,6 +2584,9 @@ bool sendAttendanceRecordToServer(
 
   HTTPClient http;
   WiFiClient client;
+
+  client.setTimeout(5000);
+  http.setTimeout(5000);
 
   String url = String(SERVER_URL) + "/api/v1/device/attendance/sync-record";
   http.begin(client, url);
