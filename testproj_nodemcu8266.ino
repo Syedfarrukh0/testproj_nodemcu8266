@@ -130,6 +130,9 @@ String savedPassword = "";
 #define EEPROM_SSID_ADDR 300
 #define EEPROM_PASS_ADDR 350
 
+unsigned long lastRFIDReinit = 0;
+#define RFID_REINIT_INTERVAL 3600000
+
 // ================== LOCAL ATTENDANCE LOGIC VARIABLES ==================
 const int GRACE_EARLY_IN = 15;
 const int GRACE_LATE_IN = 15;
@@ -397,6 +400,13 @@ void publishHeartbeat() {
   String payload;
   serializeJson(doc, payload);
   bool published = mqttClient.publish(MQTT_TOPIC_HEARTBEAT, payload.c_str());
+
+  if (ESP.getFreeHeap() < 5000) {
+    Serial.println("⚠️ Low heap — restarting!");
+    SD.end();
+    delay(500);
+    ESP.restart();
+  }
 
   if (published) {
     heartbeatFailCount = 0;
@@ -1543,6 +1553,9 @@ void handleRFID() {
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
+
+  ESP.wdtFeed();
+  yield();
 }
 
 // ================== SEND ATTENDANCE ==================
@@ -3714,25 +3727,30 @@ void loop() {
   static bool rtcSynced = false;
   unsigned long currentMillis = millis();
 
-  // static unsigned long lastRFIDCheck = 0;
-  // if (currentMillis - lastRFIDCheck >= 50) {
-  //   lastRFIDCheck = currentMillis;
-
-  //   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-  //     handleRFID();
-  //     // delay(200);
-  //   }
-  // }
   static unsigned long lastRFIDCheck = 0;
   static unsigned long lastCardScan = 0;
   if (currentMillis - lastRFIDCheck >= 50) {
     lastRFIDCheck = currentMillis;
     if (currentMillis - lastCardScan >= 500) {
-      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+      bool cardPresent = rfid.PICC_IsNewCardPresent();
+      bool cardRead = false;
+      if (cardPresent) cardRead = rfid.PICC_ReadCardSerial();
+      if (cardPresent && cardRead) {
         lastCardScan = currentMillis;
         handleRFID();
       }
+
+      // if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+      //   lastCardScan = currentMillis;
+      //   handleRFID();
+      // }
     }
+  }
+
+  if (currentMillis - lastRFIDReinit >= RFID_REINIT_INTERVAL) {
+    lastRFIDReinit = currentMillis;
+    rfid.PCD_Init();
+    Serial.println("🔄 Periodic RFID reinit");
   }
 
   if (reprovisionMode) {
@@ -3800,7 +3818,6 @@ void loop() {
       Serial.printf("WiFi disconnected. Attempt %d to reconnect...\n", wifiFailCount);
       WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
       pcf.write(WHITE_LED_PIN, HIGH);
-      delay(50);
       pcf.write(WHITE_LED_PIN, LOW);
       if (wifiFailCount >= FAIL_LIMIT) {
         checkReprovision();
