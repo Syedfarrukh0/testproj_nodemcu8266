@@ -3525,7 +3525,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Wire.begin(D1, D2);
+  Wire.begin(D2, D1);
   pcf.begin();
 
   pcf.write(WHITE_LED_PIN, LOW);
