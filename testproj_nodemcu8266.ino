@@ -1428,6 +1428,7 @@ void sendHeartbeat() {
 
 // ================== RFID HANDLER ==================
 void handleRFID() {
+  Serial.println("🔍 handleRFID called!");
   String cardUuid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     cardUuid += String(rfid.uid.uidByte[i], HEX);
@@ -3606,6 +3607,8 @@ void setup() {
 
   SPI.begin();
   rfid.PCD_Init();
+  delay(50);
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);
   Serial.println("RFID Module Initialized");
 
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
