@@ -39,6 +39,12 @@ PCF8574 pcf(PCF_ADDRESS);
 
 #define SD_OPERATION_TIMEOUT 10000
 
+#define EEPROM_GRACE_EARLY_IN_ADDR 450
+#define EEPROM_GRACE_LATE_IN_ADDR 454
+#define EEPROM_GRACE_EARLY_OUT_ADDR 458
+#define EEPROM_GRACE_LATE_OUT_ADDR 462
+#define EEPROM_MIN_WORK_ADDR 466
+
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
 #define SCHEDULES_FOLDER "/schedules"
@@ -61,8 +67,8 @@ PCF8574 pcf(PCF_ADDRESS);
 
 // ================== MANUAL TIME FOR TESTING ==================
 int manualYear = 2026;
-int manualMonth = 2;
-int manualDay = 23;
+int manualMonth = 3;
+int manualDay = 28;
 int manualHour = 2;
 int manualMinute = 10;
 int manualSecond = 0;
@@ -134,11 +140,11 @@ unsigned long lastRFIDReinit = 0;
 #define RFID_REINIT_INTERVAL 3600000
 
 // ================== LOCAL ATTENDANCE LOGIC VARIABLES ==================
-const int GRACE_EARLY_IN = 15;
-const int GRACE_LATE_IN = 15;
-const int GRACE_EARLY_OUT = 0;
-const int GRACE_LATE_OUT = 15;
-const int MIN_WORK_DURATION = 30;
+int GRACE_EARLY_IN = 15;
+int GRACE_LATE_IN = 15;
+int GRACE_EARLY_OUT = 0;
+int GRACE_LATE_OUT = 15;
+int MIN_WORK_DURATION = 0;
 const int MIN_GAP_BETWEEN_RECORDS = 10;
 
 bool autoSyncEnabled = true;
@@ -256,6 +262,39 @@ void saveServerUrlToEEPROM(String url) {
   EEPROM.commit();
 
   Serial.println("💾 Server URL saved to EEPROM: " + url);
+}
+
+// ================== Attendace setting FUNCTIONS ==================
+void loadAttendanceSettingsFromEEPROM() {
+  int val;
+
+  EEPROM.get(EEPROM_GRACE_EARLY_IN_ADDR, val);
+  if (val >= 0 && val <= 120) GRACE_EARLY_IN = val;
+
+  EEPROM.get(EEPROM_GRACE_LATE_IN_ADDR, val);
+  if (val >= 0 && val <= 120) GRACE_LATE_IN = val;
+
+  EEPROM.get(EEPROM_GRACE_EARLY_OUT_ADDR, val);
+  if (val >= 0 && val <= 120) GRACE_EARLY_OUT = val;
+
+  EEPROM.get(EEPROM_GRACE_LATE_OUT_ADDR, val);
+  if (val >= 0 && val <= 120) GRACE_LATE_OUT = val;
+
+  EEPROM.get(EEPROM_MIN_WORK_ADDR, val);
+  if (val >= 0 && val <= 480) MIN_WORK_DURATION = val;
+
+  Serial.printf("⚙️ Att Settings: EarlyIn=%d LateIn=%d EarlyOut=%d LateOut=%d MinWork=%d\n",
+                GRACE_EARLY_IN, GRACE_LATE_IN, GRACE_EARLY_OUT, GRACE_LATE_OUT, MIN_WORK_DURATION);
+}
+
+void saveAttendanceSettingsToEEPROM() {
+  EEPROM.put(EEPROM_GRACE_EARLY_IN_ADDR, GRACE_EARLY_IN);
+  EEPROM.put(EEPROM_GRACE_LATE_IN_ADDR, GRACE_LATE_IN);
+  EEPROM.put(EEPROM_GRACE_EARLY_OUT_ADDR, GRACE_EARLY_OUT);
+  EEPROM.put(EEPROM_GRACE_LATE_OUT_ADDR, GRACE_LATE_OUT);
+  EEPROM.put(EEPROM_MIN_WORK_ADDR, MIN_WORK_DURATION);
+  EEPROM.commit();
+  Serial.println("💾 Attendance settings saved to EEPROM");
 }
 
 // ================== LOCAL TIME HELPER ==================
@@ -1243,6 +1282,46 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     Serial.printf("Sent %d schedules from SD (commandId: %s)\n", totalCount, commandId.c_str());
   }
 
+  else if (command == "set_attendance_settings") {
+    String commandId = doc["commandId"] | "";
+
+    int newEarlyIn = doc["graceEarlyIn"] | GRACE_EARLY_IN;
+    int newLateIn = doc["graceLateIn"] | GRACE_LATE_IN;
+    int newEarlyOut = doc["graceEarlyOut"] | GRACE_EARLY_OUT;
+    int newLateOut = doc["graceLateOut"] | GRACE_LATE_OUT;
+    int newMinWork = doc["minWorkDuration"] | MIN_WORK_DURATION;
+
+    // Validate ranges
+    if (newEarlyIn < 0 || newEarlyIn > 120 || newLateIn < 0 || newLateIn > 120 || newEarlyOut < 0 || newEarlyOut > 120 || newLateOut < 0 || newLateOut > 120 || newMinWork < 0 || newMinWork > 480) {
+      publishMqttResponse(false, "Invalid settings values", commandId);
+      return;
+    }
+
+    GRACE_EARLY_IN = newEarlyIn;
+    GRACE_LATE_IN = newLateIn;
+    GRACE_EARLY_OUT = newEarlyOut;
+    GRACE_LATE_OUT = newLateOut;
+    MIN_WORK_DURATION = newMinWork;
+
+    saveAttendanceSettingsToEEPROM();
+
+    DynamicJsonDocument data(256);
+    data["success"] = true;
+    data["message"] = "Attendance settings updated";
+    data["graceEarlyIn"] = GRACE_EARLY_IN;
+    data["graceLateIn"] = GRACE_LATE_IN;
+    data["graceEarlyOut"] = GRACE_EARLY_OUT;
+    data["graceLateOut"] = GRACE_LATE_OUT;
+    data["minWorkDuration"] = MIN_WORK_DURATION;
+    if (commandId.length() > 0) data["commandId"] = commandId;
+
+    String payload;
+    serializeJson(data, payload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, payload.c_str());
+
+    Serial.println("⚙️ Attendance settings updated via MQTT");
+  }
+
   else if (command == "restart") {
     String commandId = doc["commandId"] | "";
     DynamicJsonDocument data(64);
@@ -2141,7 +2220,8 @@ bool saveAttendanceLogToSD(
 
   markSDOperationStart();
 
-  DateTime now = rtc.now();
+  DateTime now = getLocalTime();
+  // DateTime now = rtc.now();
 
   // Daily log (same as before)
   char dailyFilename[64];
@@ -3541,6 +3621,7 @@ void setup() {
   EEPROM.begin(512);
   loadWifiCredentials();
   loadServerUrlFromEEPROM();
+  loadAttendanceSettingsFromEEPROM();
 
   uint8_t storedLS = EEPROM.read(EEPROM_LOCAL_STORAGE_ADDR);
   if (storedLS == 0 || storedLS == 1) {
