@@ -1322,6 +1322,26 @@ void handleMqttCommand(String command, JsonDocument& doc) {
     Serial.println("⚙️ Attendance settings updated via MQTT");
   }
 
+  else if (command == "get_attendance_settings") {
+    String commandId = doc["commandId"] | "";
+
+    DynamicJsonDocument data(256);
+    data["success"] = true;
+    data["message"] = "Attendance settings fetched";
+    data["graceEarlyIn"] = GRACE_EARLY_IN;
+    data["graceLateIn"] = GRACE_LATE_IN;
+    data["graceEarlyOut"] = GRACE_EARLY_OUT;
+    data["graceLateOut"] = GRACE_LATE_OUT;
+    data["minWorkDuration"] = MIN_WORK_DURATION;
+    if (commandId.length() > 0) data["commandId"] = commandId;
+
+    String payload;
+    serializeJson(data, payload);
+    mqttClient.publish(MQTT_TOPIC_RESPONSE, payload.c_str());
+
+    Serial.println("⚙️ Attendance settings sent via MQTT");
+  }
+
   else if (command == "restart") {
     String commandId = doc["commandId"] | "";
     DynamicJsonDocument data(64);
