@@ -198,7 +198,7 @@ void saveScheduleToSD();
 bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule& foundSchedule);
 void loadTodayRecordsFromSD();
 void cleanupOldDailyFiles();
-bool syncMonthlyRecordsToServer(int year, int month);
+bool syncMonthlyRecordsToServer(int year, int month, bool forceSync = false);
 bool sendAttendanceRecordToServer(const String& cardUuid, int userId, const String& userName, const String& timestamp, const String& recordType, const String& status, const String& message, const String& dayOfWeek, const String& checkInWindow, const String& checkOutWindow);
 String getTodayAttendanceRecords();
 String getUserAttendanceRecords(String targetCardUuid);
@@ -1070,7 +1070,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
       month = now.month();
     }
 
-    bool result = syncMonthlyRecordsToServer(year, month);
+    bool result = syncMonthlyRecordsToServer(year, month, true);
 
     DynamicJsonDocument data(128);
     data["command"] = "manual_sync";
@@ -2605,10 +2605,12 @@ void cleanupOldDailyFiles() {
 }
 
 // ================== SYNC TO SERVER ==================
-bool syncMonthlyRecordsToServer(int year, int month) {
-  if (!sdMounted || !autoSyncEnabled || WiFi.status() != WL_CONNECTED) {
+bool syncMonthlyRecordsToServer(int year, int month, bool forceSync) {
+  if (!sdMounted || WiFi.status() != WL_CONNECTED) {
     return false;
   }
+
+  if (!autoSyncEnabled && !forceSync) return false;
 
   if (isSyncing) return false;
   isSyncing = true;
