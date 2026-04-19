@@ -1674,6 +1674,7 @@ bool sendAttendance(String cardUuid) {
   serializeJson(doc, payload);
 
   int code = http.POST(payload);
+  String response = "";
 
   // Read server response
   if (code > 0) {
@@ -1686,6 +1687,35 @@ bool sendAttendance(String cardUuid) {
   }
 
   http.end();
+
+  DynamicJsonDocument respDoc(512);
+  DeserializationError err = deserializeJson(respDoc, response);
+
+  DynamicJsonDocument scanDoc(512);
+  scanDoc["event"] = "card_scan";
+  scanDoc["cardUuid"] = cardUuid;
+  scanDoc["timestamp"] = getLocalTime().unixtime();
+  scanDoc["commandId"] = "scan_12345";
+
+  if (!err && code == 200) {
+    scanDoc["success"] = true;
+    scanDoc["userId"] = respDoc["userId"] | 0;
+    scanDoc["userName"] = respDoc["userName"] | "";
+    scanDoc["recordType"] = respDoc["recordType"] | "";
+    scanDoc["status"] = respDoc["status"] | "";
+    scanDoc["message"] = respDoc["message"] | "";
+  } else {
+    scanDoc["success"] = false;
+    scanDoc["reason"] = respDoc["reason"] | "server_error";
+    scanDoc["message"] = respDoc["message"] | "Attendance rejected by server";
+    scanDoc["userId"] = respDoc["userId"] | 0;
+    scanDoc["userName"] = respDoc["userName"] | "";
+  }
+
+  String scanPayload;
+  serializeJson(scanDoc, scanPayload);
+  mqttClient.publish(MQTT_TOPIC_RESPONSE, scanPayload.c_str());
+
   return (code == 200);
 }
 
