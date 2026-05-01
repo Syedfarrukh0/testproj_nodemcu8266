@@ -169,6 +169,7 @@ struct UserSchedule {
   String checkInTo;
   String checkOutFrom;
   String checkOutTo;
+  String shiftType;  // "day" or "night"
 };
 
 // ================== GLOBAL VECTORS ==================
@@ -1098,7 +1099,6 @@ void handleMqttCommand(String command, JsonDocument& doc) {
 
   else if (command == "sync_user_schedule") {
     String commandId = doc["commandId"] | "";
-
     bool replaceAll = doc["replaceAll"] | false;
 
     if (replaceAll) {
@@ -1126,18 +1126,26 @@ void handleMqttCommand(String command, JsonDocument& doc) {
                     userId, userName.c_str(), cardUuid.c_str(), schedules.size());
 
       for (JsonObject sched : schedules) {
-        int dayOfWeek = sched["dayOfWeek"] | 0;
+        int dayOfWeek = sched["dayOfWeek"] | -1;
         if (dayOfWeek == 0) continue;
+
+        int deviceDOW;
+        if (dayOfWeek == 0) {
+          deviceDOW = 7;  // Sunday
+        } else {
+          deviceDOW = dayOfWeek;  // Mon-Sat same rehta hai
+        }
 
         UserSchedule newSched;
         newSched.userId = userId;
         newSched.cardUuid = cardUuid;
         newSched.userName = userName;
-        newSched.dayOfWeek = dayOfWeek;
+        newSched.dayOfWeek = deviceDOW;
         newSched.checkInFrom = sched["checkInFrom"] | "";
         newSched.checkInTo = sched["checkInTo"] | "";
         newSched.checkOutFrom = sched["checkOutFrom"] | "";
         newSched.checkOutTo = sched["checkOutTo"] | "";
+        newSched.shiftType = sched["shiftType"] | "day";
         userSchedules.push_back(newSched);
         addedCount++;
       }
@@ -1204,6 +1212,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
               int p4 = line.indexOf(',', p3 + 1);
               int p5 = line.indexOf(',', p4 + 1);
               int p6 = line.indexOf(',', p5 + 1);
+              int p7 = line.indexOf(',', p6 + 1);
               if (p6 == -1) continue;
               JsonObject user = users.createNestedObject();
               user["id"] = line.substring(0, p1).toInt();
@@ -1213,7 +1222,8 @@ void handleMqttCommand(String command, JsonDocument& doc) {
               user["checkInFrom"] = line.substring(p3 + 1, p4);
               user["checkInTo"] = line.substring(p4 + 1, p5);
               user["checkOutFrom"] = line.substring(p5 + 1, p6);
-              user["checkOutTo"] = line.substring(p6 + 1);
+              user["checkOutTo"] = (p7 == -1) ? line.substring(p6 + 1) : line.substring(p6 + 1, p7);
+              user["shiftType"] = (p7 == -1) ? "day" : line.substring(p7 + 1);
               totalCount++;
             }
             file.close();
@@ -1253,6 +1263,7 @@ void handleMqttCommand(String command, JsonDocument& doc) {
               int p4 = line.indexOf(',', p3 + 1);
               int p5 = line.indexOf(',', p4 + 1);
               int p6 = line.indexOf(',', p5 + 1);
+              int p7 = line.indexOf(',', p6 + 1);
               if (p6 == -1) continue;
               JsonObject user = users.createNestedObject();
               user["id"] = line.substring(0, p1).toInt();
@@ -1262,7 +1273,9 @@ void handleMqttCommand(String command, JsonDocument& doc) {
               user["checkInFrom"] = line.substring(p3 + 1, p4);
               user["checkInTo"] = line.substring(p4 + 1, p5);
               user["checkOutFrom"] = line.substring(p5 + 1, p6);
-              user["checkOutTo"] = line.substring(p6 + 1);
+              // user["checkOutTo"] = line.substring(p6 + 1);
+              user["checkOutTo"] = (p7 == -1) ? line.substring(p6 + 1) : line.substring(p6 + 1, p7);
+              user["shiftType"] = (p7 == -1) ? "day" : line.substring(p7 + 1);
               totalCount++;
             }
             file.close();
@@ -1659,6 +1672,88 @@ void handleRFID() {
 }
 
 // ================== SEND ATTENDANCE ==================
+// bool sendAttendance(String cardUuid) {
+//   HTTPClient http;
+//   WiFiClient client;
+//   http.begin(client, String(SERVER_URL) + "/api/v1/attendance/record");
+//   http.addHeader("Content-Type", "application/json");
+//   http.addHeader("x-device-id", DEVICE_UUID);
+//   http.addHeader("x-device-secret", DEVICE_SECRET);
+
+//   DynamicJsonDocument doc(256);
+//   doc["cardUuid"] = cardUuid;
+//   doc["deviceUuid"] = DEVICE_UUID;
+//   String payload;
+//   serializeJson(doc, payload);
+
+//   int code = http.POST(payload);
+//   String response = "";
+
+//   // Read server response
+//   if (code > 0) {
+//     response = http.getString();
+//     Serial.println("📥 Server Response:");
+//     Serial.println(response);
+//   } else {
+//     Serial.print("❌ HTTP Error: ");
+//     Serial.println(http.errorToString(code));
+//   }
+
+//   http.end();
+
+//   DynamicJsonDocument scanDoc(512);
+//   scanDoc["event"] = "card_scan";
+//   scanDoc["cardUuid"] = cardUuid;
+//   scanDoc["timestamp"] = getLocalTime().unixtime();
+//   scanDoc["commandId"] = "scan_12345";
+//   scanDoc["success"] = (code == 200);
+
+//   DynamicJsonDocument resDoc(1024);
+
+//   if (code == 200 && response.length() > 0) {
+
+//     DeserializationError error = deserializeJson(resDoc, response);
+
+//     if (!error) {
+//       JsonObject data = resDoc["data"];
+
+//       scanDoc["message"] = resDoc["message"] | "OK";
+//       scanDoc["recordType"] = data["recordType"] | "unknown";
+//       scanDoc["status"] = data["status"] | "unknown";
+//       scanDoc["userId"] = data["userInfo"]["userId"] | 0;
+//       scanDoc["userName"] = data["user"]["name"] | "";
+
+//     } else {
+//       Serial.print("❌ JSON Parse Error: ");
+//       Serial.println(error.c_str());
+
+//       scanDoc["message"] = "Parse error";
+//       scanDoc["recordType"] = "unknown";
+//       scanDoc["status"] = "unknown";
+//       scanDoc["userId"] = 0;
+//       scanDoc["userName"] = "";
+//     }
+
+
+//     // scanDoc["message"] = "Attendance recorded";
+//     // scanDoc["recordType"] = "in";
+//     // scanDoc["status"] = "present";
+//     // scanDoc["userId"] = 0;
+//     // scanDoc["userName"] = "";
+//   } else {
+//     scanDoc["reason"] = "attendance_denied";
+//     scanDoc["message"] = "Rejected: " + String(code);
+//     scanDoc["userId"] = 0;
+//     scanDoc["userName"] = "";
+//   }
+
+//   String scanPayload;
+//   serializeJson(scanDoc, scanPayload);
+//   mqttClient.publish(MQTT_TOPIC_RESPONSE, scanPayload.c_str());
+
+//   return (code == 200);
+// }
+
 bool sendAttendance(String cardUuid) {
   HTTPClient http;
   WiFiClient client;
@@ -1674,42 +1769,73 @@ bool sendAttendance(String cardUuid) {
   serializeJson(doc, payload);
 
   int code = http.POST(payload);
-  String response = "";
 
-  // Read server response
+  String serverMessage = "";
+  String serverRecordType = "";
+  String serverStatus = "";
+  String serverUserName = "";
+  int serverUserId = 0;
+
+
   if (code > 0) {
     String response = http.getString();
+
     Serial.println("📥 Server Response:");
     Serial.println(response);
-  } else {
-    Serial.print("❌ HTTP Error: ");
-    Serial.println(http.errorToString(code));
-  }
 
+    // message
+    int msgStart = response.indexOf("\"message\":\"") + 11;
+    int msgEnd = response.indexOf("\"", msgStart);
+    if (msgStart > 10 && msgEnd > msgStart)
+      serverMessage = response.substring(msgStart, msgEnd);
+
+    // userName — "user" object ke andar
+    int unStart = response.indexOf("\"name\":\"") + 8;
+    int unEnd = response.indexOf("\"", unStart);
+    if (unStart > 7 && unEnd > unStart)
+      serverUserName = response.substring(unStart, unEnd);
+
+    // userId — "user" object ke andar
+    int uidStart = response.indexOf("\"id\":") + 5;
+    int uidEnd = response.indexOf(",", uidStart);
+    if (uidStart > 4 && uidEnd > uidStart)
+      serverUserId = response.substring(uidStart, uidEnd).toInt();
+
+    // recordType — "data" ke andar
+    int rtStart = response.indexOf("\"recordType\":\"") + 14;
+    int rtEnd = response.indexOf("\"", rtStart);
+    if (rtStart > 13 && rtEnd > rtStart)
+      serverRecordType = response.substring(rtStart, rtEnd);
+
+    // status — "data" ke andar
+    int stStart = response.indexOf("\"status\":\"") + 10;
+    int stEnd = response.indexOf("\"", stStart);
+    if (stStart > 9 && stEnd > stStart)
+      serverStatus = response.substring(stStart, stEnd);
+  }
   http.end();
 
-  DynamicJsonDocument respDoc(512);
-  DeserializationError err = deserializeJson(respDoc, response);
+  if (serverMessage.length() == 0)
+    serverMessage = code == 200 ? "Attendance recorded" : "Rejected: " + String(code);
+  if (serverRecordType.length() == 0)
+    serverRecordType = "in";
+  if (serverStatus.length() == 0)
+    serverStatus = "present";
 
-  DynamicJsonDocument scanDoc(512);
+  DynamicJsonDocument scanDoc(256);
   scanDoc["event"] = "card_scan";
   scanDoc["cardUuid"] = cardUuid;
   scanDoc["timestamp"] = getLocalTime().unixtime();
   scanDoc["commandId"] = "scan_12345";
+  scanDoc["success"] = (code == 200);
+  scanDoc["message"] = serverMessage;
+  scanDoc["recordType"] = serverRecordType;
+  scanDoc["status"] = serverStatus;
+  scanDoc["userId"] = serverUserId;
+  scanDoc["userName"] = serverUserName;
 
-  if (!err && code == 200) {
-    scanDoc["success"] = true;
-    scanDoc["userId"] = respDoc["userId"] | 0;
-    scanDoc["userName"] = respDoc["userName"] | "";
-    scanDoc["recordType"] = respDoc["recordType"] | "";
-    scanDoc["status"] = respDoc["status"] | "";
-    scanDoc["message"] = respDoc["message"] | "";
-  } else {
-    scanDoc["success"] = false;
-    scanDoc["reason"] = respDoc["reason"] | "server_error";
-    scanDoc["message"] = respDoc["message"] | "Attendance rejected by server";
-    scanDoc["userId"] = respDoc["userId"] | 0;
-    scanDoc["userName"] = respDoc["userName"] | "";
+  if (code != 200) {
+    scanDoc["reason"] = "attendance_denied";
   }
 
   String scanPayload;
@@ -2085,7 +2211,7 @@ AttendanceResult processLocalAttendance(
   int coFromSec = timeToSeconds(todaySchedule.checkOutFrom);
   int coToSec = timeToSeconds(todaySchedule.checkOutTo);
 
-  if (ciFromSec > coFromSec) {
+  if (todaySchedule.shiftType == "night") {
     result.message = "This is an overnight shift. Day shift handler only.";
     return result;
   }
@@ -2396,20 +2522,37 @@ void saveScheduleToSD() {
     // Purani file delete
     if (SD.exists(filePath.c_str())) {
       SD.remove(filePath.c_str());
+      delay(50);
     }
 
     File file = SD.open(filePath.c_str(), FILE_WRITE);
+    if (!file) {
+      delay(200);
+      file = SD.open(filePath.c_str(), FILE_WRITE);
+    }
+
+    if (!file) {
+      Serial.println("⚠️ Retrying with SD reinit...");
+      SD.end();
+      delay(300);
+      sdMounted = SD.begin(SD_CS_PIN);
+      if (sdMounted) {
+        delay(100);
+        file = SD.open(filePath.c_str(), FILE_WRITE);
+      }
+    }
+
     if (!file) {
       Serial.println("❌ Failed to create file: " + filePath);
       continue;
     }
 
-    file.println("userId,userName,dayOfWeek,checkInFrom,checkInTo,checkOutFrom,checkOutTo");
+    file.println("userId,userName,dayOfWeek,checkInFrom,checkInTo,checkOutFrom,checkOutTo,shiftType");
 
     // Is UUID ke saare schedules likho
     for (auto& s : userSchedules) {
       if (s.cardUuid == cardUuid) {
-        String line = String(s.userId) + "," + s.userName + "," + String(s.dayOfWeek) + "," + s.checkInFrom + "," + s.checkInTo + "," + s.checkOutFrom + "," + s.checkOutTo;
+        String line = String(s.userId) + "," + s.userName + "," + String(s.dayOfWeek) + "," + s.checkInFrom + "," + s.checkInTo + "," + s.checkOutFrom + "," + s.checkOutTo + "," + s.shiftType;
         file.println(line);
       }
     }
@@ -2459,6 +2602,7 @@ bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule&
     int p4 = line.indexOf(',', p3 + 1);
     int p5 = line.indexOf(',', p4 + 1);
     int p6 = line.indexOf(',', p5 + 1);
+    int p7 = line.indexOf(',', p6 + 1);
 
     if (p6 == -1) continue;
 
@@ -2474,7 +2618,10 @@ bool loadUserScheduleFromSD(const String& cardUuid, int dayOfWeek, UserSchedule&
     foundSchedule.checkInFrom = line.substring(p3 + 1, p4);
     foundSchedule.checkInTo = line.substring(p4 + 1, p5);
     foundSchedule.checkOutFrom = line.substring(p5 + 1, p6);
-    foundSchedule.checkOutTo = line.substring(p6 + 1);
+    // foundSchedule.checkOutTo = line.substring(p6 + 1);
+    foundSchedule.checkOutTo = line.substring(p6 + 1, p7 == -1 ? line.length() : p7);
+    foundSchedule.shiftType = (p7 == -1) ? "day" : line.substring(p7 + 1);
+    foundSchedule.shiftType.trim();
 
     file.close();
     markSDOperationEnd();
@@ -2575,7 +2722,8 @@ void cleanupOldDailyFiles() {
   Serial.println("🧹 Cleaning up old daily files...");
 
   DateTime localNow = getLocalTime();
-  int todayInt = localNow.year() * 10000UL + localNow.month() * 100 + localNow.day();
+  DateTime cutoff = DateTime(localNow.unixtime() - (3 * 86400UL));
+  int cutoffInt = cutoff.year() * 10000UL + cutoff.month() * 100 + cutoff.day();
 
   File root = SD.open("/");
   if (!root) {
@@ -2612,7 +2760,7 @@ void cleanupOldDailyFiles() {
     int fd = dateStr.substring(6, 8).toInt();
     int fileDateInt = fy * 10000UL + fm * 100 + fd;
 
-    if (fileDateInt < todayInt) {
+    if (fileDateInt < cutoffInt) {
       entry.close();
       String fullPath = "/" + name;
       if (SD.remove(fullPath)) {
@@ -3746,7 +3894,7 @@ void setup() {
 
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(2048);
+  mqttClient.setBufferSize(8192);
   mqttClient.setSocketTimeout(1);
 
   Serial.println("Attempting WiFi connection...");
