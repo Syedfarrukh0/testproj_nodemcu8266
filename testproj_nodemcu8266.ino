@@ -48,7 +48,7 @@ PCF8574 pcf(PCF_ADDRESS);
 // ================== SD CARD CONFIG ==================
 #define SD_CS_PIN D8
 #define SCHEDULES_FOLDER "/schedules"
-#define ATTENDANCE_FOLDER "/attendance/"
+#define ATTENDANCE_FOLDER "/att/"
 
 // ================== LED PINS on PCF8574 ==================
 #define WHITE_LED_PIN 0
@@ -63,14 +63,14 @@ PCF8574 pcf(PCF_ADDRESS);
 #define SS_PIN D4
 
 // ================== TESTING CONFIG ==================
-#define USE_NTP_TIME true
+#define USE_NTP_TIME false  // (if true use real time and false for testing fake time)
 
 // ================== MANUAL TIME FOR TESTING ==================
 int manualYear = 2026;
-int manualMonth = 3;
-int manualDay = 28;
-int manualHour = 2;
-int manualMinute = 10;
+int manualMonth = 5;
+int manualDay = 9;
+int manualHour = 0;
+int manualMinute = 30;
 int manualSecond = 0;
 
 // ================== ATTENDANCE LOGIC HEADER ==================
@@ -219,12 +219,14 @@ void resetTodayRecords();
 bool isNewDay(const DateTime& currentTime);
 void checkDayChange(const DateTime& currentTime);
 String getDayName(int dayOfWeek);
-String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW);
+// String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW);
+String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW, String& outTime = *(new String()));
 AttendanceResult processLocalAttendance(const String& cardUuid, int userId, const String& userName, const UserSchedule& todaySchedule, const DateTime& currentTime);
 bool saveAttendanceLogToSD(const String& cardUuid, int userId, const String& userName, const String& timestamp, const String& recordType, const String& status, const String& message, const String& dayOfWeek, const String& checkInWindow, const String& checkOutWindow);
 void blinkWhiteLED();
 void blinkGreenOnce();
 void blinkRedTwice();
+AttendanceResult processNightShiftAttendance(const String& cardUuid, int userId, const String& userName, const UserSchedule& todaySchedule, const DateTime& currentTime, const std::vector<TodaysRecord>& checkIns, const std::vector<TodaysRecord>& checkOuts);
 
 // ================== SERVER URL FUNCTIONS ==================
 void loadServerUrlFromEEPROM() {
@@ -1554,7 +1556,114 @@ void handleRFID() {
     currentDOW = (currentDOW == 0) ? 7 : currentDOW;
 
     UserSchedule todayScheduleObj;
-    if (!loadUserScheduleFromSD(cardUuid, currentDOW, todayScheduleObj)) {
+
+    bool scheduleFound = loadUserScheduleFromSD(cardUuid, currentDOW, todayScheduleObj);
+
+    // Night shift AM fallback
+    if (currentTime.hour() < 12) {
+      int yesterdayDOW = (currentDOW == 1) ? 7 : currentDOW - 1;
+      UserSchedule ySchedule;
+      if (loadUserScheduleFromSD(cardUuid, yesterdayDOW, ySchedule) && ySchedule.shiftType == "night") {
+        int nowSec = currentTime.hour() * 3600 + currentTime.minute() * 60 + currentTime.second();
+        int coWindowEnd = timeToSeconds(ySchedule.checkOutTo) + (GRACE_LATE_OUT * 60);
+
+        bool useYesterday = false;
+
+        if (nowSec <= coWindowEnd) {
+          // CO window abhi bhi open hai
+          useYesterday = true;
+        } else {
+          // CO window band ho chuki — check karo kya open check-in hai yesterday ki file mein
+          DateTime yesterday = DateTime(currentTime.unixtime() - 86400);
+          char yFile[32];
+          sprintf(yFile, "%s%04d%02d%02d.csv",
+                  DAILY_LOG_PREFIX, yesterday.year(), yesterday.month(), yesterday.day());
+
+          if (SD.exists(yFile)) {
+            File f = SD.open(yFile, FILE_READ);
+            if (f) {
+              int yIns = 0, yOuts = 0;
+              f.readStringUntil('\n');
+              while (f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if (line.length() == 0 || line.indexOf(cardUuid) < 0) continue;
+                int cc = 0, sp = 0;
+                String fields[10];
+                while (sp < line.length()) {
+                  int cp = line.indexOf(',', sp);
+                  if (cp == -1) cp = line.length();
+                  fields[cc++] = line.substring(sp, cp);
+                  sp = cp + 1;
+                  if (cc >= 10) break;
+                }
+                if (cc < 5) continue;
+                if (fields[4] == "in") yIns++;
+                else if (fields[4] == "out") yOuts++;
+              }
+              f.close();
+              if (yIns > 0) {
+                // Yesterday checkin tha — open hai ya complete, dono me yesterday schedule use karo
+                if (yIns > yOuts) {
+                  // Open checkin — checkout check karo today me
+                  std::vector<TodaysRecord> todayIns, todayOuts;
+                  getUserTodayRecords(cardUuid, todayIns, todayOuts);
+                  if (todayOuts.size() == 0) useYesterday = true;
+                  else useYesterday = true;  // checkout hua hy — "shift ended" msg dikhao
+                } else {
+                  useYesterday = true;  // Complete shift — "shift ended" dikhao
+                }
+              }
+            }
+          }
+        }
+
+        if (useYesterday) {
+
+          // if (scheduleFound && todayScheduleObj.shiftType == "day") {
+          if (scheduleFound) {
+            int nowSec = currentTime.hour() * 3600 + currentTime.minute() * 60 + currentTime.second();
+            int todayCiWindowStart = timeToSeconds(todayScheduleObj.checkInFrom) - (GRACE_EARLY_IN * 60);
+            if (nowSec >= todayCiWindowStart) {
+              Serial.println("📅 Today has a day shift starting — keeping today's schedule");
+              useYesterday = false;
+            }
+          }
+
+          if (useYesterday) {
+            todayScheduleObj = ySchedule;
+            scheduleFound = true;
+            Serial.println("🌙 Using yesterday's night schedule");
+          }
+        }
+      }
+    }
+
+    bool usingNextDaySchedule = false;
+    if (scheduleFound && todayScheduleObj.shiftType == "day" && currentTime.hour() >= 12) {
+      int nowSec = currentTime.hour() * 3600 + currentTime.minute() * 60 + currentTime.second();
+      int coWindowEnd = timeToSeconds(todayScheduleObj.checkOutTo) + (GRACE_LATE_OUT * 60);
+
+      if (nowSec > coWindowEnd) {
+        int tomorrowDOW = (currentDOW == 7) ? 1 : currentDOW + 1;
+        UserSchedule nextSched;
+
+        if (loadUserScheduleFromSD(cardUuid, tomorrowDOW, nextSched)) {
+          int nextCiWindowStart = timeToSeconds(nextSched.checkInFrom) - (GRACE_EARLY_IN * 60);
+          int nextCiWindowEnd = timeToSeconds(nextSched.checkInTo) + (GRACE_LATE_IN * 60);
+
+          if (nowSec >= nextCiWindowStart && nowSec <= nextCiWindowEnd) {
+            todayScheduleObj = nextSched;
+            scheduleFound = true;
+            usingNextDaySchedule = true;
+            Serial.printf("🔄 Day shift over, switching to next shift: DOW=%d type=%s\n",
+                          nextSched.dayOfWeek, nextSched.shiftType.c_str());
+          }
+        }
+      }
+    }
+
+    if (!scheduleFound) {
       String filePath = String(SCHEDULES_FOLDER) + "/" + cardUuid + ".csv";
       if (!SD.exists(filePath.c_str())) {
         Serial.println("❌ Card not found: " + cardUuid);
@@ -1583,25 +1692,144 @@ void handleRFID() {
         serializeJson(scanDoc, scanPayload);
         mqttClient.publish(MQTT_TOPIC_RESPONSE, scanPayload.c_str());
       }
-
       blinkRedTwice();
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
       return;
     }
+
     const UserSchedule* todaysSchedule = &todayScheduleObj;
 
     std::vector<TodaysRecord> userCheckIns, userCheckOuts;
     getUserTodayRecords(cardUuid, userCheckIns, userCheckOuts);
 
-    AttendanceResult localResult = processLocalAttendance(
-      cardUuid,
-      todaysSchedule->userId,
-      todaysSchedule->userName,
-      *todaysSchedule,
-      currentTime,
-      userCheckIns,
-      userCheckOuts);
+    if (todaysSchedule->shiftType == "night") {
+      int yesterdayDOW = (currentDOW == 1) ? 7 : currentDOW - 1;
+
+      bool shouldLoadYesterday =
+        (todaysSchedule->dayOfWeek == yesterdayDOW)
+        || (currentTime.hour() < 12 && todaysSchedule->shiftType == "night");
+
+      // Sirf tab padho jab schedule yesterday ka ho (fallback case ya AM checkout)
+      // if (todaysSchedule->dayOfWeek == yesterdayDOW || (usingNextDaySchedule && currentTime.hour() < 12)) {
+      if (shouldLoadYesterday) {
+        DateTime yesterday = DateTime(currentTime.unixtime() - 86400);
+        char yFile[32];
+        sprintf(yFile, "%s%04d%02d%02d.csv",
+                DAILY_LOG_PREFIX, yesterday.year(), yesterday.month(), yesterday.day());
+
+        if (SD.exists(yFile)) {
+          File f = SD.open(yFile, FILE_READ);
+          if (f) {
+            f.readStringUntil('\n');
+            while (f.available()) {
+              String line = f.readStringUntil('\n');
+              line.trim();
+              if (line.length() == 0 || line.indexOf(cardUuid) < 0) continue;
+
+              int cc = 0, sp = 0;
+              String fields[10];
+              while (sp < line.length()) {
+                int cp = line.indexOf(',', sp);
+                if (cp == -1) cp = line.length();
+                fields[cc++] = line.substring(sp, cp);
+                sp = cp + 1;
+                if (cc >= 10) break;
+              }
+              if (cc < 5) continue;
+
+              TodaysRecord rec;
+              rec.recordType = fields[4];
+              int ts = fields[0].indexOf(' ') + 1;
+              String tStr = fields[0].substring(ts);
+              rec.timestamp = tStr.substring(0, 2).toInt() * 3600
+                              + tStr.substring(3, 5).toInt() * 60
+                              + tStr.substring(6, 8).toInt();
+              rec.timestampStr = tStr;
+
+              if (rec.recordType == "in") userCheckIns.push_back(rec);
+              else if (rec.recordType == "out") userCheckOuts.push_back(rec);
+            }
+            f.close();
+          }
+        }
+      }
+    }
+
+    // Agar aaj ka apna schedule hai (fallback nahi),
+    // to ciWindowStart se pehle ke records filter karo
+    // (purani shift ke records is shift mein count nahi honge)
+    if (todaysSchedule->dayOfWeek == currentDOW || usingNextDaySchedule) {
+      int ciWindowStart = timeToSeconds(todaysSchedule->checkInFrom) - (GRACE_EARLY_IN * 60);
+
+      userCheckIns.erase(
+        std::remove_if(userCheckIns.begin(), userCheckIns.end(),
+                       [ciWindowStart](const TodaysRecord& r) {
+                         return (int)r.timestamp < ciWindowStart;
+                       }),
+        userCheckIns.end());
+
+      userCheckOuts.erase(
+        std::remove_if(userCheckOuts.begin(), userCheckOuts.end(),
+                       [ciWindowStart](const TodaysRecord& r) {
+                         return (int)r.timestamp < ciWindowStart;
+                       }),
+        userCheckOuts.end());
+
+      Serial.printf("🔍 After filter: %d checkIns, %d checkOuts (ciWindowStart=%d)\n",
+                    userCheckIns.size(), userCheckOuts.size(), ciWindowStart);
+    }
+
+    // Sirf last checkin ke BAAD ke checkouts valid hain
+    if (userCheckIns.size() > 0) {
+      unsigned long lastCheckInTime = userCheckIns.back().timestamp;
+      bool isNightShift = (todaysSchedule->shiftType == "night");
+      userCheckOuts.erase(
+        std::remove_if(userCheckOuts.begin(), userCheckOuts.end(),
+                       [lastCheckInTime, isNightShift](const TodaysRecord& r) {
+                         // Night shift: agar checkout morning mein hai (< checkin numerically)
+                         // to yeh next-day morning checkout hai — valid, mat hatao
+                         if (isNightShift && r.timestamp < lastCheckInTime) return false;
+                         return r.timestamp <= lastCheckInTime;
+                       }),
+        userCheckOuts.end());
+      Serial.printf("🔍 After last-checkin filter: lastCI=%lu, checkOuts remaining=%d\n",
+                    lastCheckInTime, userCheckOuts.size());
+    }
+
+    // Night shift ke liye: sirf CO window ke andar ke checkouts valid hain
+    if (todaysSchedule->shiftType == "night") {
+      int coWinStart = timeToSeconds(todaysSchedule->checkOutFrom) - (GRACE_EARLY_OUT * 60);
+      int coWinEnd = timeToSeconds(todaysSchedule->checkOutTo) + (GRACE_LATE_OUT * 60);
+
+      userCheckOuts.erase(
+        std::remove_if(userCheckOuts.begin(), userCheckOuts.end(),
+                       [coWinStart, coWinEnd](const TodaysRecord& r) {
+                         return !((int)r.timestamp >= coWinStart && (int)r.timestamp <= coWinEnd);
+                       }),
+        userCheckOuts.end());
+
+      Serial.printf("🔍 After CO-window filter: %d checkOuts in valid window [%d-%d]\n",
+                    userCheckOuts.size(), coWinStart, coWinEnd);
+    }
+
+    AttendanceResult localResult = (todaysSchedule->shiftType == "night")
+                                     ? processNightShiftAttendance(
+                                       cardUuid,
+                                       todaysSchedule->userId,
+                                       todaysSchedule->userName,
+                                       *todaysSchedule,
+                                       currentTime,
+                                       userCheckIns,
+                                       userCheckOuts)
+                                     : processLocalAttendance(
+                                       cardUuid,
+                                       todaysSchedule->userId,
+                                       todaysSchedule->userName,
+                                       *todaysSchedule,
+                                       currentTime,
+                                       userCheckIns,
+                                       userCheckOuts);
 
     if (localResult.success) {
       blinkGreenOnce();
@@ -1672,88 +1900,6 @@ void handleRFID() {
 }
 
 // ================== SEND ATTENDANCE ==================
-// bool sendAttendance(String cardUuid) {
-//   HTTPClient http;
-//   WiFiClient client;
-//   http.begin(client, String(SERVER_URL) + "/api/v1/attendance/record");
-//   http.addHeader("Content-Type", "application/json");
-//   http.addHeader("x-device-id", DEVICE_UUID);
-//   http.addHeader("x-device-secret", DEVICE_SECRET);
-
-//   DynamicJsonDocument doc(256);
-//   doc["cardUuid"] = cardUuid;
-//   doc["deviceUuid"] = DEVICE_UUID;
-//   String payload;
-//   serializeJson(doc, payload);
-
-//   int code = http.POST(payload);
-//   String response = "";
-
-//   // Read server response
-//   if (code > 0) {
-//     response = http.getString();
-//     Serial.println("📥 Server Response:");
-//     Serial.println(response);
-//   } else {
-//     Serial.print("❌ HTTP Error: ");
-//     Serial.println(http.errorToString(code));
-//   }
-
-//   http.end();
-
-//   DynamicJsonDocument scanDoc(512);
-//   scanDoc["event"] = "card_scan";
-//   scanDoc["cardUuid"] = cardUuid;
-//   scanDoc["timestamp"] = getLocalTime().unixtime();
-//   scanDoc["commandId"] = "scan_12345";
-//   scanDoc["success"] = (code == 200);
-
-//   DynamicJsonDocument resDoc(1024);
-
-//   if (code == 200 && response.length() > 0) {
-
-//     DeserializationError error = deserializeJson(resDoc, response);
-
-//     if (!error) {
-//       JsonObject data = resDoc["data"];
-
-//       scanDoc["message"] = resDoc["message"] | "OK";
-//       scanDoc["recordType"] = data["recordType"] | "unknown";
-//       scanDoc["status"] = data["status"] | "unknown";
-//       scanDoc["userId"] = data["userInfo"]["userId"] | 0;
-//       scanDoc["userName"] = data["user"]["name"] | "";
-
-//     } else {
-//       Serial.print("❌ JSON Parse Error: ");
-//       Serial.println(error.c_str());
-
-//       scanDoc["message"] = "Parse error";
-//       scanDoc["recordType"] = "unknown";
-//       scanDoc["status"] = "unknown";
-//       scanDoc["userId"] = 0;
-//       scanDoc["userName"] = "";
-//     }
-
-
-//     // scanDoc["message"] = "Attendance recorded";
-//     // scanDoc["recordType"] = "in";
-//     // scanDoc["status"] = "present";
-//     // scanDoc["userId"] = 0;
-//     // scanDoc["userName"] = "";
-//   } else {
-//     scanDoc["reason"] = "attendance_denied";
-//     scanDoc["message"] = "Rejected: " + String(code);
-//     scanDoc["userId"] = 0;
-//     scanDoc["userName"] = "";
-//   }
-
-//   String scanPayload;
-//   serializeJson(scanDoc, scanPayload);
-//   mqttClient.publish(MQTT_TOPIC_RESPONSE, scanPayload.c_str());
-
-//   return (code == 200);
-// }
-
 bool sendAttendance(String cardUuid) {
   HTTPClient http;
   WiFiClient client;
@@ -2030,6 +2176,16 @@ void checkDayChange(const DateTime& currentTime) {
   if (isNewDay(currentTime)) {
     cleanupOldDailyFiles();
     resetTodayRecords();
+
+    // Naya month check karo — folder pre-create karo
+    if (sdMounted) {
+      char monthFolder[32];
+      sprintf(monthFolder, "/att/%04d%02d", currentTime.year(), currentTime.month());
+      if (!SD.exists(monthFolder)) {
+        SD.mkdir(monthFolder);
+        Serial.println("📁 New month folder created: " + String(monthFolder));
+      }
+    }
   }
 }
 
@@ -2046,56 +2202,168 @@ String getDayName(int dayOfWeek) {
   }
 }
 
-String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW) {
-  if (!sdMounted) return "No upcoming schedule";
+// String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW) {
+//   if (!sdMounted) return "No upcoming schedule";
+//   markSDOperationStart();
+
+//   String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+//   if (!SD.exists(filePath.c_str())) {
+//     markSDOperationEnd();
+//     return "No upcoming schedule";
+//   }
+
+//   File file = SD.open(filePath.c_str(), FILE_READ);
+//   if (!file) {
+//     markSDOperationEnd();
+//     return "No upcoming schedule";
+//   }
+
+//   file.readStringUntil('\n');
+
+//   // Saare schedules padho aur next day dhundo
+//   std::vector<int> availableDays;
+//   while (file.available()) {
+//     String line = file.readStringUntil('\n');
+//     line.trim();
+//     if (line.length() == 0) continue;
+
+//     int p1 = line.indexOf(',');
+//     int p2 = line.indexOf(',', p1 + 1);
+//     int p3 = line.indexOf(',', p2 + 1);
+//     if (p3 == -1) continue;
+
+//     int dow = line.substring(p2 + 1, p3).toInt();
+//     availableDays.push_back(dow);
+//   }
+
+//   file.close();
+
+//   // Next schedule dhundo
+//   for (int i = 1; i <= 7; i++) {
+//     int checkDay = currentDOW + i;
+//     if (checkDay > 7) checkDay -= 7;
+
+//     for (int d : availableDays) {
+//       if (d == checkDay) {
+//         markSDOperationEnd();
+//         return getDayName(checkDay);
+//       }
+//     }
+//   }
+
+//   markSDOperationEnd();
+//   return "No upcoming schedule";
+// }
+
+String getNextScheduleInfo(int userId, const String& cardUuid, int currentDOW, String& outTime) {
+  if (!sdMounted) {
+    outTime = "";
+    return "No upcoming schedule";
+  }
   markSDOperationStart();
 
-  String filePath = String(SCHEDULES_FOLDER) + cardUuid + ".csv";
+  String filePath = String(SCHEDULES_FOLDER) + "/" + cardUuid + ".csv";
   if (!SD.exists(filePath.c_str())) {
     markSDOperationEnd();
+    outTime = "";
     return "No upcoming schedule";
   }
 
   File file = SD.open(filePath.c_str(), FILE_READ);
   if (!file) {
     markSDOperationEnd();
+    outTime = "";
     return "No upcoming schedule";
   }
 
+  // Header skip
   file.readStringUntil('\n');
 
-  // Saare schedules padho aur next day dhundo
-  std::vector<int> availableDays;
+  // Pehle SAARE available schedules collect karo
+  struct ScheduleInfo {
+    int dow;
+    String checkInFrom;
+    int checkInSec;
+  };
+
+  std::vector<ScheduleInfo> allSchedules;
+
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
 
+    // Parse: userId,userName,dayOfWeek,checkInFrom,checkInTo,checkOutFrom,checkOutTo,shiftType
     int p1 = line.indexOf(',');
     int p2 = line.indexOf(',', p1 + 1);
     int p3 = line.indexOf(',', p2 + 1);
-    if (p3 == -1) continue;
+    int p4 = line.indexOf(',', p3 + 1);
+    int p5 = line.indexOf(',', p4 + 1);  // checkInTo
+
+    if (p5 == -1) continue;
 
     int dow = line.substring(p2 + 1, p3).toInt();
-    availableDays.push_back(dow);
-  }
+    String checkInFrom = line.substring(p3 + 1, p4);
 
+    ScheduleInfo si;
+    si.dow = dow;
+    si.checkInFrom = checkInFrom;
+    si.checkInSec = timeToSeconds(checkInFrom);
+
+    allSchedules.push_back(si);
+
+    Serial.printf("   Available: DOW=%d, Time=%s\n", dow, checkInFrom.c_str());
+  }
   file.close();
 
-  // Next schedule dhundo
-  for (int i = 1; i <= 7; i++) {
-    int checkDay = currentDOW + i;
+  if (allSchedules.size() == 0) {
+    markSDOperationEnd();
+    outTime = "";
+    return "No upcoming schedule";
+  }
+
+  // Ab next upcoming schedule dhundo - aaj se start karo
+  // Agar aaj ka day hai aur check-in time abhi future mein hai, to wahi upcoming hai
+  DateTime now = getLocalTime();
+  int nowSec = now.hour() * 3600 + now.minute() * 60 + now.second();
+
+  for (int offset = 0; offset <= 7; offset++) {
+    int checkDay = currentDOW + offset;
     if (checkDay > 7) checkDay -= 7;
 
-    for (int d : availableDays) {
-      if (d == checkDay) {
-        markSDOperationEnd();
-        return getDayName(checkDay);
+    Serial.printf("   Looking for DOW=%d, offset=%d\n", checkDay, offset);
+
+    for (size_t j = 0; j < allSchedules.size(); j++) {
+      if (allSchedules[j].dow == checkDay) {
+        // Agar aaj ka day hai, to check karo ke time future mein hai ya nahi
+        if (offset == 0) {
+          // Aaj ka schedule - check if time is still upcoming
+          if (allSchedules[j].checkInSec > nowSec) {
+            outTime = allSchedules[j].checkInFrom;
+            String dayName = getDayName(checkDay);
+            Serial.printf("   ✅ Found TODAY: %s at %s\n", dayName.c_str(), outTime.c_str());
+            markSDOperationEnd();
+            return dayName;
+          } else {
+            Serial.printf("   ⏩ Skipping today's schedule (time passed: %s < %s)\n",
+                          allSchedules[j].checkInFrom.c_str(),
+                          secondsToTimeStr(nowSec).c_str());
+            continue;  // Time pass ho chuka, agli shift dhundo
+          }
+        } else {
+          // Agle din ki shift - definitely upcoming hai
+          outTime = allSchedules[j].checkInFrom;
+          String dayName = getDayName(checkDay);
+          Serial.printf("   ✅ Found: %s at %s\n", dayName.c_str(), outTime.c_str());
+          markSDOperationEnd();
+          return dayName;
+        }
       }
     }
   }
 
   markSDOperationEnd();
+  outTime = "";
   return "No upcoming schedule";
 }
 
@@ -2334,7 +2602,13 @@ AttendanceResult processLocalAttendance(
       return result;
     } else {
       // User already checked out
-      result.message = "✅ Today's shift completed.";
+      String nextTime = "";
+      String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+      if (nextDay != "No upcoming schedule") {
+        result.message = "✅ Today's shift completed. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+      } else {
+        result.message = "✅ Today's shift completed.";
+      }
       result.recordType = "out";
       return result;
     }
@@ -2363,17 +2637,357 @@ AttendanceResult processLocalAttendance(
   return result;
 }
 
+AttendanceResult processNightShiftAttendance(
+  const String& cardUuid,
+  int userId,
+  const String& userName,
+  const UserSchedule& todaySchedule,
+  const DateTime& currentTime,
+  const std::vector<TodaysRecord>& checkIns,
+  const std::vector<TodaysRecord>& checkOuts) {
+
+  AttendanceResult result;
+  result.success = false;
+  result.recordType = "";
+  result.status = "present";
+  result.shouldDeletePreviousCheckOuts = false;
+
+  int currentDOW = currentTime.dayOfTheWeek();
+  currentDOW = (currentDOW == 0) ? 7 : currentDOW;
+
+  int nowSec = currentTime.hour() * 3600 + currentTime.minute() * 60 + currentTime.second();
+
+  int ciFrom = timeToSeconds(todaySchedule.checkInFrom);
+  int ciTo = timeToSeconds(todaySchedule.checkInTo);
+  int coFrom = timeToSeconds(todaySchedule.checkOutFrom);
+  int coTo = timeToSeconds(todaySchedule.checkOutTo);
+
+  int ciWindowStart = ciFrom - (GRACE_EARLY_IN * 60);
+  int ciWindowEnd = ciTo + (GRACE_LATE_IN * 60);
+  int coWindowStart = coFrom - (GRACE_EARLY_OUT * 60);
+  int coWindowEnd = coTo + (GRACE_LATE_OUT * 60);
+
+  // Server jaise zone detection — window based
+  bool isEveningSide = (nowSec >= ciWindowStart);
+  bool isMorningSide = (nowSec <= coWindowEnd);
+  bool isDeadZone = (!isEveningSide && !isMorningSide);
+
+  // Special case: check-in crosses midnight (e.g. 23:59 → 00:10)
+  bool ciCrossesMidnight = (ciTo < ciFrom);
+
+  bool isInCheckInWindow;
+  if (ciCrossesMidnight) {
+    bool eveningPart = (isEveningSide && nowSec >= ciWindowStart);
+    bool morningPart = (isMorningSide && nowSec <= ciWindowEnd);
+    isInCheckInWindow = eveningPart || morningPart;
+  } else {
+    isInCheckInWindow = (isEveningSide && nowSec >= ciWindowStart && nowSec <= ciWindowEnd);
+  }
+
+  bool isInCheckOutWindow = (isMorningSide && nowSec >= coWindowStart && nowSec <= coWindowEnd);
+
+  bool hasOpenCheckIn = (checkIns.size() > 0 && checkIns.size() > checkOuts.size());
+  bool shiftComplete = (checkIns.size() > 0 && checkOuts.size() > 0);
+
+  // Anti-spam
+  if (checkIns.size() > 0 || checkOuts.size() > 0) {
+    int lastRecordTime = 0;
+    if (checkOuts.size() > 0) lastRecordTime = checkOuts.back().timestamp;
+    if (checkIns.size() > 0 && checkIns.back().timestamp > lastRecordTime)
+      lastRecordTime = checkIns.back().timestamp;
+
+    // Night shift: lastRecordTime may be from yesterday (high seconds like 79200)
+    // nowSec may be low (e.g. 7200 AM) — adjust
+    int gap;
+    if (lastRecordTime > 43200 && nowSec < 43200) {
+      // yesterday PM record, today AM time
+      gap = (86400 - lastRecordTime) + nowSec;
+    } else {
+      gap = nowSec - lastRecordTime;
+    }
+    if (gap >= 0 && gap < MIN_GAP_BETWEEN_RECORDS) {
+      result.message = "Please wait " + String(MIN_GAP_BETWEEN_RECORDS) + " seconds";
+      return result;
+    }
+  }
+
+  // ══ SPECIAL CASE: ciTo < ciFrom (midnight cross check-in) ══
+  if (ciCrossesMidnight) {
+    if (isInCheckOutWindow) {
+      if (checkIns.size() == 0) {
+        result.message = "You missed check-in for this shift";
+        return result;
+      }
+      result.recordType = "out";
+      result.success = true;
+      result.shouldDeletePreviousCheckOuts = true;
+      if (nowSec < coFrom) {
+        result.status = "early";
+        result.message = "Checked out early";
+      } else if (nowSec <= coTo) {
+        result.status = "present";
+        result.message = "Checked out on time";
+      } else {
+        result.status = "late";
+        result.message = "Checked out late";
+      }
+
+      if (checkOuts.size() == 0 && checkIns.size() > 0) {
+        int lastCISec = checkIns.back().timestamp;
+        int worked;
+        if (lastCISec > 43200 && nowSec < 43200) {
+          worked = ((86400 - lastCISec) + nowSec) / 60;
+        } else {
+          worked = (nowSec - lastCISec) / 60;
+        }
+        if (MIN_WORK_DURATION > 0 && worked < MIN_WORK_DURATION) {
+          result.success = false;
+          result.message = "Min work duration not met: " + String(MIN_WORK_DURATION) + " min required";
+          return result;
+        }
+      }
+
+    } else if (isInCheckInWindow) {
+      // isInCheckInWindow already computed above for midnight cross
+      if (hasOpenCheckIn) {
+        result.message = "Already checked in. Check-out opens at " + formatTimeDisplay(todaySchedule.checkOutFrom);
+        return result;
+      }
+      result.recordType = "in";
+      result.success = true;
+      bool eveningPart = (isEveningSide && nowSec >= ciWindowStart);
+      if (eveningPart) {
+        if (nowSec < ciFrom) {
+          result.status = "early";
+          result.message = "Checked in early";
+        } else {
+          result.status = "present";
+          result.message = "Checked in on time";
+        }
+      } else {
+        if (nowSec <= ciTo) {
+          result.status = "present";
+          result.message = "Checked in on time";
+        } else {
+          result.status = "late";
+          result.message = "Checked in late";
+        }
+      }
+
+    } else if (isMorningSide && nowSec < coWindowStart) {
+      if (hasOpenCheckIn) {
+        result.message = "Already checked in. Check-out opens at " + formatTimeDisplay(todaySchedule.checkOutFrom);
+        return result;
+      }
+      result.message = "Check-in window closed";
+      return result;
+
+      // } else if (isMorningSide && nowSec > coWindowEnd) {
+    } else if (nowSec < 43200 && nowSec > coWindowEnd) {
+      if (hasOpenCheckIn) {
+        // result.message = "Checkout window closed. You missed check-out";
+        String nextTime = "";
+        String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+        if (nextDay != "No upcoming schedule") {
+          result.message = "Checkout window closed. You missed check-out. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+        } else {
+          result.message = "Checkout window closed. You missed check-out";
+        }
+        return result;
+      }
+      // 🔴 FIX #3: Shift ended with next schedule info
+      if (shiftComplete) {
+        String nextTime = "";
+        String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+        if (nextDay != "No upcoming schedule") {
+          result.message = "Shift ended. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+        } else {
+          result.message = "Shift ended. No upcoming schedule found";
+        }
+      } else {
+        result.message = "Shift ended";
+      }
+      return result;
+
+    } else {
+      result.message = "Shift hasn't started yet. Check-in opens at " + formatTimeDisplay(todaySchedule.checkInFrom);
+      return result;
+    }
+
+    // Record timestamp
+    if (result.success) {
+      char buf[20];
+      sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+              currentTime.year(), currentTime.month(), currentTime.day(),
+              currentTime.hour(), currentTime.minute(), currentTime.second());
+      result.timestamp = String(buf);
+      result.formattedTime = formatTimeDisplay(secondsToTimeStr(nowSec));
+      addRecord(result.recordType, currentTime, userId, cardUuid, userName);
+    }
+    return result;
+  }
+  // ══ END MIDNIGHT CROSS ══
+
+  // ══ DEAD ZONE ══
+  if (isDeadZone) {
+    if (nowSec < ciWindowStart) {
+      // Morning after shift ended
+      if (hasOpenCheckIn) {
+        result.message = "Checkout window closed. You missed check-out";
+        return result;
+      }
+      // 🔴 FIX #1: Shift complete with next schedule info
+      if (shiftComplete) {
+        String nextTime = "";
+        String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+        if (nextDay != "No upcoming schedule") {
+          result.message = "Shift complete. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+        } else {
+          result.message = "Shift complete. No upcoming schedule found";
+        }
+        return result;
+      }
+      // result.message = "Shift ended";
+      String nextTime = "";
+      String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+      if (nextDay != "No upcoming schedule") {
+        result.message = "Shift ended. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+      } else {
+        result.message = "Shift ended. No upcoming schedule found";
+      }
+      return result;
+    }
+    // Afternoon before shift starts
+    result.message = "Shift hasn't started yet. Check-in opens at " + formatTimeDisplay(todaySchedule.checkInFrom);
+    return result;
+  }
+
+  // ══ CHECKOUT WINDOW ══
+  if (isInCheckOutWindow) {
+    if (checkIns.size() == 0) {
+      result.message = "You missed check-in for this shift";
+      return result;
+    }
+    result.recordType = "out";
+    result.success = true;
+    result.shouldDeletePreviousCheckOuts = true;
+
+    if (nowSec < coFrom) {
+      result.status = "early";
+      result.message = "Checked out early";
+    } else if (nowSec <= coTo) {
+      result.status = "present";
+      result.message = "Checked out on time";
+    } else {
+      result.status = "late";
+      result.message = "Checked out late";
+    }
+
+    if (checkOuts.size() == 0 && checkIns.size() > 0) {
+      int lastCISec = checkIns.back().timestamp;
+      int worked;
+      if (lastCISec > 43200 && nowSec < 43200) {
+        worked = ((86400 - lastCISec) + nowSec) / 60;
+      } else {
+        worked = (nowSec - lastCISec) / 60;
+      }
+      if (MIN_WORK_DURATION > 0 && worked < MIN_WORK_DURATION) {
+        result.success = false;
+        result.message = "Min work duration not met: " + String(MIN_WORK_DURATION) + " min required";
+        return result;
+      }
+    }
+
+    // ══ MORNING SIDE - BEFORE CHECKOUT WINDOW ══
+  } else if (isMorningSide && nowSec < coWindowStart) {
+    if (hasOpenCheckIn) {
+      result.message = "Already checked in. Check-out opens at " + formatTimeDisplay(todaySchedule.checkOutFrom);
+      return result;
+    }
+    result.message = "Check-in window closed";
+    return result;
+
+    // ══ MORNING SIDE - AFTER CHECKOUT WINDOW ══
+  } else if (isMorningSide && nowSec > coWindowEnd) {
+    if (hasOpenCheckIn) {
+      result.message = "Checkout window closed. You missed check-out";
+      return result;
+    }
+    if (shiftComplete) {
+      String nextTime = "";
+      String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+      if (nextDay != "No upcoming schedule") {
+        result.message = "Shift ended. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+      } else {
+        result.message = "Shift ended. No upcoming schedule found";
+      }
+    } else {
+      result.message = "Shift ended";
+    }
+    return result;
+
+    // ══ EVENING SIDE ══
+  } else if (isEveningSide) {
+    if (hasOpenCheckIn) {
+      result.message = "Already checked in. Check-out opens at " + formatTimeDisplay(todaySchedule.checkOutFrom) + " (next morning)";
+      return result;
+    }
+    // 🔴 FIX #2: Today's shift complete with next schedule info
+    if (shiftComplete) {
+      String nextTime = "";
+      String nextDay = getNextScheduleInfo(userId, cardUuid, currentDOW, nextTime);
+      if (nextDay != "No upcoming schedule") {
+        result.message = "Today's shift complete. Next: " + nextDay + " at " + formatTimeDisplay(nextTime);
+      } else {
+        result.message = "Today's shift complete. No upcoming schedule found";
+      }
+      return result;
+    }
+    if (!isInCheckInWindow) {
+      if (nowSec > ciWindowEnd) {
+        result.message = "Check-in window closed at " + formatTimeDisplay(todaySchedule.checkInTo);
+        return result;
+      }
+      result.message = "Check-in opens at " + formatTimeDisplay(todaySchedule.checkInFrom);
+      return result;
+    }
+
+    result.recordType = "in";
+    result.success = true;
+    if (nowSec < ciFrom) {
+      result.status = "early";
+      result.message = "Checked in early";
+    } else if (nowSec <= ciTo) {
+      result.status = "present";
+      result.message = "Checked in on time";
+    } else {
+      result.status = "late";
+      result.message = "Checked in late";
+    }
+
+  } else {
+    result.message = "Unable to process attendance at this time";
+    return result;
+  }
+
+  if (result.success) {
+    char buf[20];
+    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+            currentTime.year(), currentTime.month(), currentTime.day(),
+            currentTime.hour(), currentTime.minute(), currentTime.second());
+    result.timestamp = String(buf);
+    result.formattedTime = formatTimeDisplay(secondsToTimeStr(nowSec));
+    addRecord(result.recordType, currentTime, userId, cardUuid, userName);
+  }
+
+  return result;
+}
+
 String lastCreatedMonthFolder = "";
 
 void ensureAttendanceFolders(const char* monthFolder) {
-  if (!attendanceFolderReady) {
-    if (!SD.exists("/attendance")) SD.mkdir("/attendance");
-    attendanceFolderReady = true;
-  }
-  if (String(monthFolder) != lastCreatedMonthFolder) {
-    if (!SD.exists(monthFolder)) SD.mkdir(monthFolder);
-    lastCreatedMonthFolder = String(monthFolder);
-  }
+  attendanceFolderReady = true;
+  lastCreatedMonthFolder = String(monthFolder);
 }
 
 // ================== SAVE TO SD FUNCTIONS ==================
@@ -2421,55 +3035,123 @@ bool saveAttendanceLogToSD(
   dailyFile.println(line);
   dailyFile.flush();
   dailyFile.close();
-
   Serial.println("Daily attendance saved → " + String(dailyFilename));
+
+  delay(50);
 
   // Monthly per-user in month folder
   char monthFolder[32];
-  sprintf(monthFolder, "/attendance/%04d-%02d", now.year(), now.month());
+  sprintf(monthFolder, "/att/%04d%02d", now.year(), now.month());
+
+  // ===== DEBUG LOGS START =====
+  Serial.println("📁 /att exists: " + String(SD.exists("/att") ? "YES" : "NO"));
+  Serial.println("📁 monthFolder: " + String(monthFolder));
+  Serial.println("📁 monthFolder exists: " + String(SD.exists(monthFolder) ? "YES" : "NO"));
+  // ===== DEBUG LOGS END =====
 
   ensureAttendanceFolders(monthFolder);
+  delay(50);
 
   // User file
-  String userFilePath = String(monthFolder) + "/" + cardUuid + ".csv";
-  Serial.println("User monthly file path: " + userFilePath);
+  // User file — use 8.3 format for better compatibility
+  char userFilePath[64];
 
-  bool userFileExists = SD.exists(userFilePath.c_str());
+  // Use shorter path: /att/YYYYMM/UUID.csv instead of /att/YYYYMM/UUID.csv
+  // This avoids the long path issue on ESP8266 SD library
+  sprintf(userFilePath, "/att/%04d%02d/%s.csv",
+          now.year(), now.month(), cardUuid.c_str());
 
-  File userFile;
+  // Also create a shorter-named month folder
+  char shortMonthFolder[32];
+  sprintf(shortMonthFolder, "/att/%04d%02d", now.year(), now.month());
 
-  if (userFileExists) {
-    // Pehle read mode mein open karo size pata karne ke liye
-    File tempRead = SD.open(userFilePath.c_str(), FILE_READ);
-    uint32_t fileSize = 0;
-    if (tempRead) {
-      fileSize = tempRead.size();
-      tempRead.close();
+  Serial.println("📄 Opening: " + String(userFilePath));
+
+  // Ensure short folder exists
+  if (!SD.exists("/att")) {
+    SD.mkdir("/att");
+    delay(50);
+    Serial.println("📁 Created /att");
+  }
+
+  if (!SD.exists(shortMonthFolder)) {
+    // SD reinit before creating subfolder
+    SD.end();
+    delay(200);
+    SPI.begin();
+    delay(50);
+    sdMounted = SD.begin(SD_CS_PIN);
+    delay(200);
+    Serial.println("📁 SD reinit for monthly folder: " + String(sdMounted ? "OK" : "FAIL"));
+
+    if (sdMounted) {
+      // Re-check /att exists after reinit
+      if (!SD.exists("/att")) {
+        SD.mkdir("/att");
+        delay(50);
+      }
+
+      bool folderCreated = SD.mkdir(shortMonthFolder);
+      Serial.println("📁 Creating " + String(shortMonthFolder) + ": " + String(folderCreated ? "OK" : "FAIL"));
+
+      if (!folderCreated) {
+        // Retry once
+        delay(200);
+        folderCreated = SD.mkdir(shortMonthFolder);
+        Serial.println("📁 Retry mkdir: " + String(folderCreated ? "OK" : "FAIL"));
+      }
+
+      if (!folderCreated) {
+        Serial.println("❌ Cannot create month folder, using root fallback");
+        // Fallback to root with month prefix
+        sprintf(userFilePath, "/att_%04d%02d_%s.csv", now.year(), now.month(), cardUuid.c_str());
+      }
+      delay(100);
     }
+  }
 
-    userFile = SD.open(userFilePath.c_str(), FILE_WRITE);
+  bool userFileExists = SD.exists(userFilePath);
+
+  // Try to open file
+  File userFile = SD.open(userFilePath, FILE_WRITE);
+
+  // Retry if failed
+  if (!userFile) {
+    delay(300);
+    userFile = SD.open(userFilePath, FILE_WRITE);
+  }
+
+  // If still failed, use root fallback
+  if (!userFile) {
+    Serial.println("❌ Failed to open: " + String(userFilePath));
+
+    // Fallback: save in root with month+user prefix
+    char fallback[64];
+    sprintf(fallback, "/att%04d%02d_%s.csv", now.year(), now.month(), cardUuid.c_str());
+    Serial.println("⚠️ Using fallback: " + String(fallback));
+
+    userFile = SD.open(fallback, FILE_WRITE);
+
     if (!userFile) {
-      Serial.println("Failed to open user monthly file for append: " + userFilePath);
-      return true;
+      Serial.println("❌ Even fallback failed!");
+      markSDOperationEnd();
+      return false;
     }
-    userFile.seek(fileSize);
-    Serial.println("Appending to existing user file at position: " + String(fileSize));
+  }
 
-  } else {
-    userFile = SD.open(userFilePath.c_str(), FILE_WRITE);
-    if (!userFile) {
-      Serial.println("Failed to create user monthly file: " + userFilePath);
-      return true;
-    }
+  // Write header if new file
+  if (!userFileExists) {
     userFile.println("Timestamp,CardUUID,UserID,UserName,Type,Status,Message,DayOfWeek,CheckInWindow,CheckOutWindow");
-    Serial.println("Created new user monthly file with header");
+    Serial.println("✅ Header written");
+  } else {
+    // Seek to end for append
+    userFile.seek(userFile.size());
   }
 
   userFile.println(line);
   userFile.flush();
   userFile.close();
-
-  Serial.println("Monthly attendance saved (per user) → " + userFilePath);
+  Serial.println("✅ Monthly saved → " + String(userFilePath));
   markSDOperationEnd();
   return true;
 }
@@ -2796,7 +3478,7 @@ bool syncMonthlyRecordsToServer(int year, int month, bool forceSync) {
   markSDOperationStart();
 
   char monthFolder[32];
-  sprintf(monthFolder, ATTENDANCE_FOLDER "%04d-%02d/", year, month);
+  sprintf(monthFolder, ATTENDANCE_FOLDER "%04d%02d/", year, month);
 
   if (!SD.exists(monthFolder)) {
     Serial.println("No attendance folder for " + String(monthFolder) + " - nothing to sync");
@@ -2946,7 +3628,7 @@ bool syncMonthlyRecordsToServer(int year, int month, bool forceSync) {
   }
 
   dir.close();
-  Serial.printf("Monthly sync complete for %04d-%02d: Total synced %d, failed %d\n",
+  Serial.printf("Monthly sync complete for %04d%02d: Total synced %d, failed %d\n",
                 year, month, totalSynced, totalFailed);
   markSDOperationEnd();
   isSyncing = false;
@@ -3256,7 +3938,7 @@ String getMonthlyAttendanceRecords(int year, int month) {
   markSDOperationStart();
 
   char monthFolder[32];
-  sprintf(monthFolder, "/attendance/%04d-%02d", year, month);
+  sprintf(monthFolder, "/att/%04d%02d", year, month);
 
   Serial.println("DEBUG monthFolder: " + String(monthFolder));
   Serial.println("DEBUG folder exists: " + String(SD.exists(monthFolder) ? "YES" : "NO"));
@@ -3376,7 +4058,7 @@ String getUserMonthlyRecords(String targetCardUuid, int year, int month) {
   markSDOperationStart();
 
   char filePath[80];
-  sprintf(filePath, "/attendance/%04d-%02d/%s.csv", year, month, targetCardUuid.c_str());
+  sprintf(filePath, "/att/%04d%02d/%s.csv", year, month, targetCardUuid.c_str());
 
   Serial.println("Looking for user monthly file: " + String(filePath));
 
@@ -3451,7 +4133,7 @@ String deleteMonthlyFile(int year, int month) {
   markSDOperationStart();
 
   char monthFolder[32];
-  sprintf(monthFolder, "/attendance/%04d-%02d", year, month);
+  sprintf(monthFolder, "/att/%04d%02d", year, month);
 
   if (!SD.exists(monthFolder)) {
     markSDOperationEnd();
@@ -3513,7 +4195,7 @@ String deleteUserFromMonthlyFile(String targetCardUuid, int year, int month) {
   markSDOperationStart();
 
   char filePath[80];
-  sprintf(filePath, "/attendance/%04d-%02d/%s.csv", year, month, targetCardUuid.c_str());
+  sprintf(filePath, "/att/%04d%02d/%s.csv", year, month, targetCardUuid.c_str());
 
   Serial.println("Deleting user file: " + String(filePath));
 
@@ -3587,8 +4269,8 @@ String listAllLogFiles() {
   root.close();
 
   // ================== MONTHLY FILES (/attendance/ folder mein) ==================
-  if (SD.exists("/attendance")) {
-    File attendanceDir = SD.open("/attendance");
+  if (SD.exists("/att")) {
+    File attendanceDir = SD.open("/att");
     if (attendanceDir) {
 
       while (true) {
@@ -3606,7 +4288,7 @@ String listAllLogFiles() {
 
         Serial.println("DEBUG monthFolder: " + monthFolderName);
 
-        String monthFolderPath = "/attendance/" + monthFolderName;
+        String monthFolderPath = "/att/" + monthFolderName;
         File userDir = SD.open(monthFolderPath.c_str());
 
         if (userDir) {
@@ -3869,16 +4551,31 @@ void setup() {
   sdMounted = initSDCard();
   if (sdMounted) {
     if (!SD.exists("/schedules")) SD.mkdir("/schedules");
-    if (!SD.exists("/attendance")) {
-      SD.mkdir("/attendance");
-      attendanceFolderReady = true;
-    }
+    if (!SD.exists("/att")) SD.mkdir("/att");
+    attendanceFolderReady = true;
   }
 
   if (!rtc.begin()) {
     Serial.println("❌ RTC not found");
   } else {
     Serial.println("RTC detected");
+  }
+
+#if USE_NTP_TIME == false
+  DateTime tempTime(manualYear, manualMonth, manualDay, manualHour, manualMinute, manualSecond);
+  rtc.adjust(tempTime);
+#endif
+
+  if (sdMounted) {
+    DateTime now = getLocalTime();
+    char monthFolder[32];
+    sprintf(monthFolder, "/att/%04d%02d", now.year(), now.month());
+    if (!SD.exists(monthFolder)) {
+      bool r = SD.mkdir(monthFolder);
+      Serial.println("📁 Month folder: " + String(r ? "OK" : "FAIL → " + String(monthFolder)));
+    } else {
+      Serial.println("📁 Month folder exists: " + String(monthFolder));
+    }
   }
 
   pcf.write(WHITE_LED_PIN, HIGH);
