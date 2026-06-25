@@ -63,14 +63,14 @@ PCF8574 pcf(PCF_ADDRESS);
 #define SS_PIN D4
 
 // ================== TESTING CONFIG ==================
-#define USE_NTP_TIME false  // (if true use real time and false for testing fake time)
+#define USE_NTP_TIME true  // (if true use real time and false for testing fake time)
 
 // ================== MANUAL TIME FOR TESTING ==================
 int manualYear = 2026;
 int manualMonth = 5;
-int manualDay = 9;
-int manualHour = 0;
-int manualMinute = 30;
+int manualDay = 10;
+int manualHour = 1;
+int manualMinute = 28;
 int manualSecond = 0;
 
 // ================== ATTENDANCE LOGIC HEADER ==================
